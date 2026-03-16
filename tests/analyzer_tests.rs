@@ -1,16 +1,15 @@
-use chip8_lang::analyzer::Analyzer;
+use chip8_lang::analyzer::{AnalyzeError, AnalyzeErrorKind, Analyzer};
 use chip8_lang::lexer::Lexer;
 use chip8_lang::parser::Parser;
+use chip8_lang::parser::ast::BuiltinFunction;
 
-fn analyze(input: &str) -> Result<(), Vec<String>> {
+fn analyze(input: &str) -> Result<(), Vec<AnalyzeError>> {
     let mut lexer = Lexer::new(input);
     let tokens = lexer.tokenize().unwrap();
     let mut parser = Parser::new(tokens);
     let program = parser.parse_program().unwrap();
     let mut analyzer = Analyzer::new();
-    analyzer
-        .analyze(&program)
-        .map_err(|errs| errs.into_iter().map(|e| e.message).collect())
+    analyzer.analyze(&program)
 }
 
 fn analyze_ok(input: &str) {
@@ -19,13 +18,27 @@ fn analyze_ok(input: &str) {
     }
 }
 
-fn analyze_err(input: &str, expected_msg: &str) {
+fn analyze_err_kind(input: &str, expected: AnalyzeErrorKind) {
     match analyze(input) {
-        Ok(()) => panic!("expected error containing '{expected_msg}', got Ok"),
+        Ok(()) => panic!("expected error {:?}, got Ok", expected),
         Err(errs) => {
             assert!(
-                errs.iter().any(|e| e.contains(expected_msg)),
-                "expected error containing '{expected_msg}', got: {:?}",
+                errs.iter().any(|e| e.kind == expected),
+                "expected {:?}, got: {:?}",
+                expected,
+                errs
+            );
+        }
+    }
+}
+
+fn analyze_err_matches(input: &str, pred: impl Fn(&AnalyzeErrorKind) -> bool) {
+    match analyze(input) {
+        Ok(()) => panic!("expected error, got Ok"),
+        Err(errs) => {
+            assert!(
+                errs.iter().any(|e| pred(&e.kind)),
+                "no matching error in: {:?}",
                 errs
             );
         }
@@ -69,74 +82,94 @@ fn test_if_else_types_match() {
 
 #[test]
 fn test_undefined_variable() {
-    analyze_err(
+    analyze_err_kind(
         "
         fn main() -> () {
             set_delay(x);
         }
     ",
-        "undefined variable: 'x'",
+        AnalyzeErrorKind::UndefinedVariable("x".into()),
     );
 }
 
 #[test]
 fn test_undefined_function() {
-    analyze_err(
+    analyze_err_kind(
         "
         fn main() -> () {
             foo();
         }
     ",
-        "undefined function: 'foo'",
+        AnalyzeErrorKind::UndefinedFunction("foo".into()),
     );
 }
 
 #[test]
 fn test_type_mismatch_in_let() {
-    analyze_err(
+    analyze_err_matches(
         "
         fn main() -> () {
             let x: bool = 42;
         }
     ",
-        "type mismatch in let",
+        |k| {
+            matches!(
+                k,
+                AnalyzeErrorKind::TypeMismatch {
+                    context: "type mismatch in let",
+                    ..
+                }
+            )
+        },
     );
 }
 
 #[test]
 fn test_return_type_mismatch() {
-    analyze_err(
+    analyze_err_matches(
         "
         fn f() -> u8 {
             true
         }
         fn main() -> () { }
     ",
-        "return type mismatch",
+        |k| {
+            matches!(
+                k,
+                AnalyzeErrorKind::TypeMismatch {
+                    context: "return type mismatch",
+                    ..
+                }
+            )
+        },
     );
 }
 
 #[test]
 fn test_wrong_arg_count() {
-    analyze_err(
+    analyze_err_kind(
         "
         fn main() -> () {
             set_delay(1, 2);
         }
     ",
-        "expects 1 args, got 2",
+        AnalyzeErrorKind::BuiltinArgCountMismatch {
+            builtin: BuiltinFunction::SetDelay,
+            expected: 1,
+            found: 2,
+        },
     );
 }
 
 #[test]
 fn test_break_outside_loop() {
-    analyze_err(
+    analyze_err_kind(
         "
         fn main() -> () {
             break;
         }
     ",
-        "break outside of loop",
+        AnalyzeErrorKind::BreakOutsideLoop,
     );
 }
 
@@ -155,50 +188,50 @@ fn test_break_inside_loop() {
 
 #[test]
 fn test_missing_main() {
-    analyze_err(
+    analyze_err_kind(
         "
         fn foo() -> () { }
     ",
-        "missing 'main' function",
+        AnalyzeErrorKind::MissingMain,
     );
 }
 
 #[test]
 fn test_if_else_type_mismatch() {
-    analyze_err(
+    analyze_err_matches(
         "
         fn f(x: u8) -> u8 {
             if x > 5 { 10 } else { true }
         }
         fn main() -> () { }
     ",
-        "if/else type mismatch",
+        |k| matches!(k, AnalyzeErrorKind::IfElseBranchMismatch { .. }),
     );
 }
 
 #[test]
 fn test_if_condition_not_bool() {
-    analyze_err(
+    analyze_err_matches(
         "
         fn f(x: u8) -> u8 {
             if x { 10 } else { 0 }
         }
         fn main() -> () { }
     ",
-        "if condition must be bool",
+        |k| matches!(k, AnalyzeErrorKind::IfConditionNotBool(_)),
     );
 }
 
 #[test]
 fn test_logical_op_requires_bool() {
-    analyze_err(
+    analyze_err_matches(
         "
         fn f(x: u8, y: u8) -> bool {
             x && y
         }
         fn main() -> () { }
     ",
-        "logical op requires bool",
+        |k| matches!(k, AnalyzeErrorKind::LogicalOpRequiresBool(_)),
     );
 }
 
@@ -230,14 +263,14 @@ fn test_sprite_and_draw() {
 
 #[test]
 fn test_assign_type_mismatch() {
-    analyze_err(
+    analyze_err_matches(
         "
         fn main() -> () {
             let x: u8 = 10;
             x = true;
         }
     ",
-        "assignment type mismatch",
+        |k| matches!(k, AnalyzeErrorKind::AssignmentTypeMismatch { .. }),
     );
 }
 
@@ -272,4 +305,28 @@ fn test_design_doc_program() {
         }
     "#,
     );
+}
+
+#[test]
+fn test_too_many_locals() {
+    // 11 パラメータ → 上限 10 を超えるのでエラー
+    let params: Vec<String> = (0..11).map(|i| format!("p{i}: u8")).collect();
+    let input = format!(
+        "fn f({}) -> () {{ }} fn main() -> () {{ }}",
+        params.join(", ")
+    );
+    analyze_err_matches(&input, |k| {
+        matches!(k, AnalyzeErrorKind::TooManyLocals { .. })
+    });
+}
+
+#[test]
+fn test_max_locals_ok() {
+    // 10 パラメータ → ちょうど上限なので OK
+    let params: Vec<String> = (0..10).map(|i| format!("p{i}: u8")).collect();
+    let input = format!(
+        "fn f({}) -> () {{ }} fn main() -> () {{ }}",
+        params.join(", ")
+    );
+    analyze_ok(&input);
 }

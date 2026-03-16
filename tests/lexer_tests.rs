@@ -228,21 +228,21 @@ fn test_span_tracking() {
 fn test_error_unexpected_char() {
     let mut lexer = Lexer::new("@");
     let err = lexer.tokenize().unwrap_err();
-    assert!(err.message.contains("unexpected character"));
+    assert!(err.message().contains("unexpected character"));
 }
 
 #[test]
 fn test_error_invalid_hex() {
     let mut lexer = Lexer::new("0x");
     let err = lexer.tokenize().unwrap_err();
-    assert!(err.message.contains("hex"));
+    assert!(err.message().contains("hex"));
 }
 
 #[test]
 fn test_error_invalid_binary() {
     let mut lexer = Lexer::new("0b");
     let err = lexer.tokenize().unwrap_err();
-    assert!(err.message.contains("binary"));
+    assert!(err.message().contains("binary"));
 }
 
 #[test]

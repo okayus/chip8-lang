@@ -3,11 +3,34 @@ pub mod ast;
 use crate::lexer::token::{Span, Token, TokenKind};
 use ast::*;
 
-/// Parser のエラー
+/// パースエラーの種類
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseErrorKind {
+    /// 期待したトークンと異なるトークンが出現
+    UnexpectedToken { expected: String, found: TokenKind },
+    /// 型名として認識できない識別子
+    UnknownType(String),
+    /// 代入のターゲットが識別子でない
+    InvalidAssignmentTarget,
+}
+
+/// パースエラー
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
-    pub message: String,
+    pub kind: ParseErrorKind,
     pub span: Span,
+}
+
+impl ParseError {
+    pub fn message(&self) -> String {
+        match &self.kind {
+            ParseErrorKind::UnexpectedToken { expected, found } => {
+                format!("expected {expected}, found {found:?}")
+            }
+            ParseErrorKind::UnknownType(name) => format!("unknown type: {name}"),
+            ParseErrorKind::InvalidAssignmentTarget => "invalid assignment target".to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for ParseError {
@@ -15,7 +38,9 @@ impl std::fmt::Display for ParseError {
         write!(
             f,
             "{}:{}: {}",
-            self.span.line, self.span.column, self.message
+            self.span.line,
+            self.span.column,
+            self.message()
         )
     }
 }
@@ -68,7 +93,10 @@ impl Parser {
             Ok(span)
         } else {
             Err(ParseError {
-                message: format!("expected {:?}, found {:?}", expected, self.peek()),
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: format!("{:?}", expected),
+                    found: self.peek().clone(),
+                },
                 span,
             })
         }
@@ -81,7 +109,10 @@ impl Parser {
             Ok((name, span))
         } else {
             Err(ParseError {
-                message: format!("expected identifier, found {:?}", self.peek()),
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: "identifier".to_string(),
+                    found: self.peek().clone(),
+                },
                 span,
             })
         }
@@ -94,7 +125,10 @@ impl Parser {
             TokenKind::Fn => self.parse_fn_def(),
             TokenKind::Let => self.parse_let_def(),
             _ => Err(ParseError {
-                message: format!("expected 'fn' or 'let', found {:?}", self.peek()),
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: "'fn' or 'let'".to_string(),
+                    found: self.peek().clone(),
+                },
                 span: self.current_span(),
             }),
         }
@@ -172,7 +206,7 @@ impl Parser {
                         Ok(Type::Sprite(size as usize))
                     }
                     _ => Err(ParseError {
-                        message: format!("unknown type: {name}"),
+                        kind: ParseErrorKind::UnknownType(name),
                         span,
                     }),
                 }
@@ -191,7 +225,10 @@ impl Parser {
                 Ok(Type::Array(Box::new(elem_type), size as usize))
             }
             _ => Err(ParseError {
-                message: format!("expected type, found {:?}", self.peek()),
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: "type".to_string(),
+                    found: self.peek().clone(),
+                },
                 span,
             }),
         }
@@ -205,7 +242,10 @@ impl Parser {
             Ok(v)
         } else {
             Err(ParseError {
-                message: format!("expected integer literal, found {:?}", self.peek()),
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: "integer literal".to_string(),
+                    found: self.peek().clone(),
+                },
                 span,
             })
         }
@@ -407,10 +447,13 @@ impl Parser {
                     self.advance();
                     let args = self.parse_call_args()?;
                     self.expect(&TokenKind::RParen)?;
-                    Ok(Expr {
-                        kind: ExprKind::Call { name, args },
-                        span,
-                    })
+                    // 組み込み関数ならBuiltinCallに解決
+                    let kind = if let Some(builtin) = BuiltinFunction::from_name(&name) {
+                        ExprKind::BuiltinCall { builtin, args }
+                    } else {
+                        ExprKind::Call { name, args }
+                    };
+                    Ok(Expr { kind, span })
                 } else {
                     Ok(Expr {
                         kind: ExprKind::Ident(name),
@@ -455,7 +498,10 @@ impl Parser {
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Loop => self.parse_loop_expr(),
             _ => Err(ParseError {
-                message: format!("expected expression, found {:?}", self.peek()),
+                kind: ParseErrorKind::UnexpectedToken {
+                    expected: "expression".to_string(),
+                    found: self.peek().clone(),
+                },
                 span,
             }),
         }
@@ -517,7 +563,7 @@ impl Parser {
                     });
                 } else {
                     return Err(ParseError {
-                        message: "invalid assignment target".to_string(),
+                        kind: ParseErrorKind::InvalidAssignmentTarget,
                         span: self.current_span(),
                     });
                 }
@@ -526,7 +572,10 @@ impl Parser {
                 tail_expr = Some(Box::new(expr));
             } else {
                 return Err(ParseError {
-                    message: format!("expected ';' or '}}', found {:?}", self.peek()),
+                    kind: ParseErrorKind::UnexpectedToken {
+                        expected: "';' or '}'".to_string(),
+                        found: self.peek().clone(),
+                    },
                     span: self.current_span(),
                 });
             }

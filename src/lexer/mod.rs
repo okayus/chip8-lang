@@ -2,20 +2,45 @@ pub mod token;
 
 use token::{Span, Token, TokenKind};
 
-/// Lexer のエラー
+/// 字句解析エラーの種類
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LexErrorKind {
+    /// 不正な数値リテラル (値, 基数名)
+    InvalidNumber { literal: String, base: &'static str },
+    /// プレフィックス後に数字がない
+    ExpectedDigitsAfterPrefix { prefix: &'static str },
+    /// 未知の文字
+    UnexpectedCharacter(char),
+}
+
+/// 字句解析エラー
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexError {
-    pub message: String,
+    pub kind: LexErrorKind,
     pub span: Span,
+}
+
+impl LexError {
+    /// テスト互換のためのメッセージ文字列
+    pub fn message(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl std::fmt::Display for LexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:{}: {}",
-            self.span.line, self.span.column, self.message
-        )
+        let msg = match &self.kind {
+            LexErrorKind::InvalidNumber { literal, base } => {
+                format!("invalid {base} number: {literal}")
+            }
+            LexErrorKind::ExpectedDigitsAfterPrefix { prefix } => {
+                format!("expected {prefix} digits after {prefix}")
+            }
+            LexErrorKind::UnexpectedCharacter(ch) => {
+                format!("unexpected character: '{ch}'")
+            }
+        };
+        write!(f, "{}:{}: {}", self.span.line, self.span.column, msg)
     }
 }
 
@@ -165,7 +190,10 @@ impl Lexer {
             }
         }
         let value = s.parse::<u64>().map_err(|_| LexError {
-            message: format!("invalid decimal number: {s}"),
+            kind: LexErrorKind::InvalidNumber {
+                literal: s.clone(),
+                base: "decimal",
+            },
             span,
         })?;
         Ok(Token::new(TokenKind::IntLiteral(value), span))
@@ -183,12 +211,15 @@ impl Lexer {
         }
         if s.is_empty() {
             return Err(LexError {
-                message: "expected hex digits after 0x".to_string(),
+                kind: LexErrorKind::ExpectedDigitsAfterPrefix { prefix: "hex" },
                 span,
             });
         }
         let value = u64::from_str_radix(&s, 16).map_err(|_| LexError {
-            message: format!("invalid hex number: 0x{s}"),
+            kind: LexErrorKind::InvalidNumber {
+                literal: format!("0x{s}"),
+                base: "hex",
+            },
             span,
         })?;
         Ok(Token::new(TokenKind::IntLiteral(value), span))
@@ -206,12 +237,15 @@ impl Lexer {
         }
         if s.is_empty() {
             return Err(LexError {
-                message: "expected binary digits after 0b".to_string(),
+                kind: LexErrorKind::ExpectedDigitsAfterPrefix { prefix: "binary" },
                 span,
             });
         }
         let value = u64::from_str_radix(&s, 2).map_err(|_| LexError {
-            message: format!("invalid binary number: 0b{s}"),
+            kind: LexErrorKind::InvalidNumber {
+                literal: format!("0b{s}"),
+                base: "binary",
+            },
             span,
         })?;
         Ok(Token::new(TokenKind::IntLiteral(value), span))
@@ -309,7 +343,7 @@ impl Lexer {
                     TokenKind::AndAnd
                 } else {
                     return Err(LexError {
-                        message: format!("unexpected character: '{ch}'"),
+                        kind: LexErrorKind::UnexpectedCharacter(ch),
                         span,
                     });
                 }
@@ -320,14 +354,14 @@ impl Lexer {
                     TokenKind::OrOr
                 } else {
                     return Err(LexError {
-                        message: format!("unexpected character: '{ch}'"),
+                        kind: LexErrorKind::UnexpectedCharacter(ch),
                         span,
                     });
                 }
             }
             _ => {
                 return Err(LexError {
-                    message: format!("unexpected character: '{ch}'"),
+                    kind: LexErrorKind::UnexpectedCharacter(ch),
                     span,
                 });
             }

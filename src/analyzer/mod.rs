@@ -2,15 +2,167 @@ use std::collections::HashMap;
 
 use crate::parser::ast::*;
 
+/// UserRegister の総数 (V0-VE)
+const USER_REGISTER_COUNT: usize = 15;
+/// コード生成が式評価中に消費する一時レジスタの最大数
+const MAX_TEMP_REGISTERS: usize = 5;
+/// 1 関数内で使えるローカル変数の上限 (パラメータ含む)
+const MAX_LOCALS: usize = USER_REGISTER_COUNT - MAX_TEMP_REGISTERS;
+
+/// 意味解析エラーの種類
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnalyzeErrorKind {
+    /// main 関数が定義されていない
+    MissingMain,
+    /// 未定義の変数を参照
+    UndefinedVariable(String),
+    /// 未定義の関数を呼び出し
+    UndefinedFunction(String),
+    /// 型の不一致 (context は "in let", "return type" など文脈を示す)
+    TypeMismatch {
+        context: &'static str,
+        expected: Type,
+        found: Type,
+    },
+    /// 二項演算の型不一致
+    BinaryOpTypeMismatch { lhs: Type, rhs: Type },
+    /// ユーザー定義関数の引数の数が合わない
+    ArgumentCountMismatch {
+        function: String,
+        expected: usize,
+        found: usize,
+    },
+    /// ユーザー定義関数の引数の型が合わない
+    ArgumentTypeMismatch {
+        function: String,
+        expected: Type,
+        found: Type,
+    },
+    /// 組み込み関数の引数の数が合わない
+    BuiltinArgCountMismatch {
+        builtin: BuiltinFunction,
+        expected: usize,
+        found: usize,
+    },
+    /// 組み込み関数の引数の型が合わない
+    BuiltinArgTypeMismatch {
+        builtin: BuiltinFunction,
+        expected: Type,
+        found: Type,
+    },
+    /// 論理演算子に bool 以外が渡された
+    LogicalOpRequiresBool(Type),
+    /// 符号反転に u8 以外が渡された
+    NegationRequiresU8(Type),
+    /// 論理否定に bool 以外が渡された
+    LogicalNotRequiresBool(Type),
+    /// if 条件が bool でない
+    IfConditionNotBool(Type),
+    /// if/else の型が一致しない
+    IfElseBranchMismatch { then_type: Type, else_type: Type },
+    /// ローカル変数が多すぎる (テンポラリレジスタ分を差し引いた上限)
+    TooManyLocals { count: usize, max: usize },
+    /// 配列でない型にインデックスアクセス
+    CannotIndex(Type),
+    /// 配列インデックスが u8 でない
+    ArrayIndexNotU8(Type),
+    /// 配列要素の型が統一されていない
+    ArrayElementMismatch,
+    /// loop の外で break
+    BreakOutsideLoop,
+    /// 代入の型不一致
+    AssignmentTypeMismatch { expected: Type, found: Type },
+}
+
 /// 意味解析エラー
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzeError {
-    pub message: String,
+    pub kind: AnalyzeErrorKind,
 }
 
 impl std::fmt::Display for AnalyzeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        match &self.kind {
+            AnalyzeErrorKind::MissingMain => write!(f, "missing 'main' function"),
+            AnalyzeErrorKind::UndefinedVariable(name) => {
+                write!(f, "undefined variable: '{name}'")
+            }
+            AnalyzeErrorKind::UndefinedFunction(name) => {
+                write!(f, "undefined function: '{name}'")
+            }
+            AnalyzeErrorKind::TypeMismatch {
+                context,
+                expected,
+                found,
+            } => write!(f, "{context}: expected {expected:?}, found {found:?}"),
+            AnalyzeErrorKind::BinaryOpTypeMismatch { lhs, rhs } => {
+                write!(f, "binary op type mismatch: {lhs:?} vs {rhs:?}")
+            }
+            AnalyzeErrorKind::ArgumentCountMismatch {
+                function,
+                expected,
+                found,
+            } => write!(f, "'{function}' expects {expected} args, got {found}"),
+            AnalyzeErrorKind::ArgumentTypeMismatch {
+                function,
+                expected,
+                found,
+            } => write!(
+                f,
+                "argument type mismatch in '{function}': expected {expected:?}, found {found:?}"
+            ),
+            AnalyzeErrorKind::BuiltinArgCountMismatch {
+                builtin,
+                expected,
+                found,
+            } => write!(
+                f,
+                "'{}' expects {expected} args, got {found}",
+                builtin.name()
+            ),
+            AnalyzeErrorKind::BuiltinArgTypeMismatch {
+                builtin,
+                expected,
+                found,
+            } => write!(
+                f,
+                "argument type mismatch in '{}': expected {expected:?}, found {found:?}",
+                builtin.name()
+            ),
+            AnalyzeErrorKind::LogicalOpRequiresBool(ty) => {
+                write!(f, "logical op requires bool, found {ty:?}")
+            }
+            AnalyzeErrorKind::NegationRequiresU8(ty) => {
+                write!(f, "negation requires u8, found {ty:?}")
+            }
+            AnalyzeErrorKind::LogicalNotRequiresBool(ty) => {
+                write!(f, "logical not requires bool, found {ty:?}")
+            }
+            AnalyzeErrorKind::IfConditionNotBool(ty) => {
+                write!(f, "if condition must be bool, found {ty:?}")
+            }
+            AnalyzeErrorKind::IfElseBranchMismatch {
+                then_type,
+                else_type,
+            } => write!(f, "if/else type mismatch: {then_type:?} vs {else_type:?}"),
+            AnalyzeErrorKind::TooManyLocals { count, max } => {
+                write!(f, "too many local variables: {count} (max {max})")
+            }
+            AnalyzeErrorKind::CannotIndex(ty) => write!(f, "cannot index into {ty:?}"),
+            AnalyzeErrorKind::ArrayIndexNotU8(ty) => {
+                write!(f, "array index must be u8, found {ty:?}")
+            }
+            AnalyzeErrorKind::ArrayElementMismatch => {
+                write!(f, "array elements must have the same type")
+            }
+            AnalyzeErrorKind::BreakOutsideLoop => write!(f, "break outside of loop"),
+            AnalyzeErrorKind::AssignmentTypeMismatch { expected, found } => {
+                write!(
+                    f,
+                    "assignment type mismatch: expected {expected:?}, found {found:?}"
+                )
+            }
+        }
     }
 }
 
@@ -25,7 +177,7 @@ struct FnSig {
 pub struct Analyzer {
     /// グローバル変数の型
     globals: HashMap<String, Type>,
-    /// 関数シグネチャ
+    /// ユーザー定義関数のシグネチャ
     functions: HashMap<String, FnSig>,
     /// ローカルスコープスタック
     locals: Vec<HashMap<String, Type>>,
@@ -39,100 +191,14 @@ pub struct Analyzer {
 
 impl Analyzer {
     pub fn new() -> Self {
-        let mut analyzer = Self {
+        Self {
             globals: HashMap::new(),
             functions: HashMap::new(),
             locals: Vec::new(),
             current_return_type: None,
             loop_depth: 0,
             errors: Vec::new(),
-        };
-        analyzer.register_builtins();
-        analyzer
-    }
-
-    fn register_builtins(&mut self) {
-        // clear()
-        self.functions.insert(
-            "clear".into(),
-            FnSig {
-                params: vec![],
-                return_type: Type::Unit,
-            },
-        );
-        // draw(sprite, x, y) -> bool
-        // sprite は任意の sprite 型として、ここでは特殊扱い
-        self.functions.insert(
-            "draw".into(),
-            FnSig {
-                params: vec![Type::Sprite(0), Type::U8, Type::U8],
-                return_type: Type::Bool,
-            },
-        );
-        // wait_key() -> u8
-        self.functions.insert(
-            "wait_key".into(),
-            FnSig {
-                params: vec![],
-                return_type: Type::U8,
-            },
-        );
-        // is_key_pressed(k) -> bool
-        self.functions.insert(
-            "is_key_pressed".into(),
-            FnSig {
-                params: vec![Type::U8],
-                return_type: Type::Bool,
-            },
-        );
-        // delay() -> u8
-        self.functions.insert(
-            "delay".into(),
-            FnSig {
-                params: vec![],
-                return_type: Type::U8,
-            },
-        );
-        // set_delay(v: u8)
-        self.functions.insert(
-            "set_delay".into(),
-            FnSig {
-                params: vec![Type::U8],
-                return_type: Type::Unit,
-            },
-        );
-        // set_sound(v: u8)
-        self.functions.insert(
-            "set_sound".into(),
-            FnSig {
-                params: vec![Type::U8],
-                return_type: Type::Unit,
-            },
-        );
-        // random(mask: u8) -> u8
-        self.functions.insert(
-            "random".into(),
-            FnSig {
-                params: vec![Type::U8],
-                return_type: Type::U8,
-            },
-        );
-        // bcd(v: u8)
-        self.functions.insert(
-            "bcd".into(),
-            FnSig {
-                params: vec![Type::U8],
-                return_type: Type::Unit,
-            },
-        );
-        // draw_digit(v: u8, x, y)
-        self.functions.insert(
-            "draw_digit".into(),
-            FnSig {
-                params: vec![Type::U8, Type::U8, Type::U8],
-                return_type: Type::Unit,
-            },
-        );
+        }
     }
 
     pub fn analyze(&mut self, program: &Program) -> Result<(), Vec<AnalyzeError>> {
@@ -162,7 +228,7 @@ impl Analyzer {
         // main 関数の存在チェック
         if !self.functions.contains_key("main") {
             self.errors.push(AnalyzeError {
-                message: "missing 'main' function".into(),
+                kind: AnalyzeErrorKind::MissingMain,
             });
         }
 
@@ -170,12 +236,16 @@ impl Analyzer {
         for top in &program.top_levels {
             match top {
                 TopLevel::LetDef { ty, value, .. } => {
-                    let value_ty = self.check_expr(value);
+                    let value_ty = self.type_check_expr(value);
                     if let Some(vt) = value_ty
                         && !Self::types_compatible(ty, &vt)
                     {
                         self.errors.push(AnalyzeError {
-                            message: format!("type mismatch: expected {:?}, found {:?}", ty, vt),
+                            kind: AnalyzeErrorKind::TypeMismatch {
+                                context: "type mismatch",
+                                expected: ty.clone(),
+                                found: vt,
+                            },
                         });
                     }
                 }
@@ -188,32 +258,31 @@ impl Analyzer {
                     self.current_return_type = Some(return_type.clone());
                     self.locals.push(HashMap::new());
 
-                    // 引数をローカルスコープに追加
                     for param in params {
                         self.insert_local(param.name.clone(), param.ty.clone());
                     }
 
-                    let body_ty = self.check_expr(body);
+                    let body_ty = self.type_check_expr(body);
                     if let Some(bt) = body_ty
                         && !Self::types_compatible(return_type, &bt)
                     {
                         self.errors.push(AnalyzeError {
-                            message: format!(
-                                "return type mismatch: expected {:?}, found {:?}",
-                                return_type, bt
-                            ),
+                            kind: AnalyzeErrorKind::TypeMismatch {
+                                context: "return type mismatch",
+                                expected: return_type.clone(),
+                                found: bt,
+                            },
                         });
                     }
 
-                    // ローカル変数数チェック (引数含めて最大15個)
                     if let Some(scope) = self.locals.last()
-                        && scope.len() > 15
+                        && scope.len() > MAX_LOCALS
                     {
                         self.errors.push(AnalyzeError {
-                            message: format!(
-                                "too many local variables: {} (max 15, V0-VE)",
-                                scope.len()
-                            ),
+                            kind: AnalyzeErrorKind::TooManyLocals {
+                                count: scope.len(),
+                                max: MAX_LOCALS,
+                            },
                         });
                     }
 
@@ -237,13 +306,11 @@ impl Analyzer {
     }
 
     fn lookup_var(&self, name: &str) -> Option<Type> {
-        // ローカルスコープを後ろから探索
         for scope in self.locals.iter().rev() {
             if let Some(ty) = scope.get(name) {
                 return Some(ty.clone());
             }
         }
-        // グローバル
         self.globals.get(name).cloned()
     }
 
@@ -256,14 +323,12 @@ impl Analyzer {
                 s1 == s2 && Self::types_compatible(e1, e2)
             }
             (Type::Sprite(_), Type::Sprite(_)) => true,
-            // sprite は u8 配列リテラルで初期化可能
             (Type::Sprite(n), Type::Array(elem, m)) => *n == *m && **elem == Type::U8,
             _ => false,
         }
     }
 
-    /// 式の型チェック。型を返す (エラー時は None)
-    fn check_expr(&mut self, expr: &Expr) -> Option<Type> {
+    fn type_check_expr(&mut self, expr: &Expr) -> Option<Type> {
         match &expr.kind {
             ExprKind::IntLiteral(_) => Some(Type::U8),
             ExprKind::BoolLiteral(_) => Some(Type::Bool),
@@ -272,19 +337,19 @@ impl Analyzer {
                     Some(ty)
                 } else {
                     self.errors.push(AnalyzeError {
-                        message: format!("undefined variable: '{name}'"),
+                        kind: AnalyzeErrorKind::UndefinedVariable(name.clone()),
                     });
                     None
                 }
             }
             ExprKind::BinaryOp { op, lhs, rhs } => {
-                let lhs_ty = self.check_expr(lhs);
-                let rhs_ty = self.check_expr(rhs);
+                let lhs_ty = self.type_check_expr(lhs);
+                let rhs_ty = self.type_check_expr(rhs);
                 match (lhs_ty, rhs_ty) {
                     (Some(lt), Some(rt)) => {
                         if !Self::types_compatible(&lt, &rt) {
                             self.errors.push(AnalyzeError {
-                                message: format!("binary op type mismatch: {:?} vs {:?}", lt, rt),
+                                kind: AnalyzeErrorKind::BinaryOpTypeMismatch { lhs: lt, rhs: rt },
                             });
                             return None;
                         }
@@ -298,10 +363,7 @@ impl Analyzer {
                             BinOp::And | BinOp::Or => {
                                 if lt != Type::Bool {
                                     self.errors.push(AnalyzeError {
-                                        message: format!(
-                                            "logical op requires bool, found {:?}",
-                                            lt
-                                        ),
+                                        kind: AnalyzeErrorKind::LogicalOpRequiresBool(lt),
                                     });
                                     None
                                 } else {
@@ -315,12 +377,12 @@ impl Analyzer {
                 }
             }
             ExprKind::UnaryOp { op, expr: inner } => {
-                let ty = self.check_expr(inner)?;
+                let ty = self.type_check_expr(inner)?;
                 match op {
                     UnaryOp::Neg => {
                         if ty != Type::U8 {
                             self.errors.push(AnalyzeError {
-                                message: format!("negation requires u8, found {:?}", ty),
+                                kind: AnalyzeErrorKind::NegationRequiresU8(ty),
                             });
                             None
                         } else {
@@ -330,7 +392,7 @@ impl Analyzer {
                     UnaryOp::Not => {
                         if ty != Type::Bool {
                             self.errors.push(AnalyzeError {
-                                message: format!("logical not requires bool, found {:?}", ty),
+                                kind: AnalyzeErrorKind::LogicalNotRequiresBool(ty),
                             });
                             None
                         } else {
@@ -339,35 +401,62 @@ impl Analyzer {
                     }
                 }
             }
+            ExprKind::BuiltinCall { builtin, args } => {
+                let (param_types, return_type) = builtin.signature();
+                if args.len() != param_types.len() {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::BuiltinArgCountMismatch {
+                            builtin: *builtin,
+                            expected: param_types.len(),
+                            found: args.len(),
+                        },
+                    });
+                    return None;
+                }
+                for (arg, param_ty) in args.iter().zip(param_types.iter()) {
+                    if let Some(arg_ty) = self.type_check_expr(arg)
+                        && !Self::types_compatible(param_ty, &arg_ty)
+                    {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::BuiltinArgTypeMismatch {
+                                builtin: *builtin,
+                                expected: param_ty.clone(),
+                                found: arg_ty,
+                            },
+                        });
+                    }
+                }
+                Some(return_type)
+            }
             ExprKind::Call { name, args } => {
                 if let Some(sig) = self.functions.get(name).cloned() {
                     if args.len() != sig.params.len() {
                         self.errors.push(AnalyzeError {
-                            message: format!(
-                                "'{}' expects {} args, got {}",
-                                name,
-                                sig.params.len(),
-                                args.len()
-                            ),
+                            kind: AnalyzeErrorKind::ArgumentCountMismatch {
+                                function: name.clone(),
+                                expected: sig.params.len(),
+                                found: args.len(),
+                            },
                         });
                         return None;
                     }
                     for (arg, param_ty) in args.iter().zip(sig.params.iter()) {
-                        if let Some(arg_ty) = self.check_expr(arg)
+                        if let Some(arg_ty) = self.type_check_expr(arg)
                             && !Self::types_compatible(param_ty, &arg_ty)
                         {
                             self.errors.push(AnalyzeError {
-                                message: format!(
-                                    "argument type mismatch in '{}': expected {:?}, found {:?}",
-                                    name, param_ty, arg_ty
-                                ),
+                                kind: AnalyzeErrorKind::ArgumentTypeMismatch {
+                                    function: name.clone(),
+                                    expected: param_ty.clone(),
+                                    found: arg_ty,
+                                },
                             });
                         }
                     }
                     Some(sig.return_type)
                 } else {
                     self.errors.push(AnalyzeError {
-                        message: format!("undefined function: '{name}'"),
+                        kind: AnalyzeErrorKind::UndefinedFunction(name.clone()),
                     });
                     None
                 }
@@ -377,21 +466,24 @@ impl Analyzer {
                 then_block,
                 else_block,
             } => {
-                if let Some(cond_ty) = self.check_expr(cond)
+                if let Some(cond_ty) = self.type_check_expr(cond)
                     && cond_ty != Type::Bool
                 {
                     self.errors.push(AnalyzeError {
-                        message: format!("if condition must be bool, found {:?}", cond_ty),
+                        kind: AnalyzeErrorKind::IfConditionNotBool(cond_ty),
                     });
                 }
-                let then_ty = self.check_expr(then_block);
+                let then_ty = self.type_check_expr(then_block);
                 if let Some(else_block) = else_block {
-                    let else_ty = self.check_expr(else_block);
+                    let else_ty = self.type_check_expr(else_block);
                     match (then_ty, else_ty) {
                         (Some(t), Some(e)) => {
                             if !Self::types_compatible(&t, &e) {
                                 self.errors.push(AnalyzeError {
-                                    message: format!("if/else type mismatch: {:?} vs {:?}", t, e),
+                                    kind: AnalyzeErrorKind::IfElseBranchMismatch {
+                                        then_type: t,
+                                        else_type: e,
+                                    },
                                 });
                                 None
                             } else {
@@ -401,22 +493,21 @@ impl Analyzer {
                         _ => None,
                     }
                 } else {
-                    // if without else → Unit
                     Some(Type::Unit)
                 }
             }
             ExprKind::Loop { body } => {
                 self.loop_depth += 1;
-                self.check_expr(body);
+                self.type_check_expr(body);
                 self.loop_depth -= 1;
                 Some(Type::Unit)
             }
             ExprKind::Block { stmts, expr } => {
                 for stmt in stmts {
-                    self.check_stmt(stmt);
+                    self.type_check_stmt(stmt);
                 }
                 if let Some(tail) = expr {
-                    self.check_expr(tail)
+                    self.type_check_expr(tail)
                 } else {
                     Some(Type::Unit)
                 }
@@ -425,74 +516,78 @@ impl Analyzer {
                 if elems.is_empty() {
                     return Some(Type::Array(Box::new(Type::U8), 0));
                 }
-                let first_ty = self.check_expr(&elems[0]);
+                let first_ty = self.type_check_expr(&elems[0]);
                 for elem in &elems[1..] {
-                    if let (Some(ft), Some(et)) = (&first_ty, self.check_expr(elem))
+                    if let (Some(ft), Some(et)) = (&first_ty, self.type_check_expr(elem))
                         && !Self::types_compatible(ft, &et)
                     {
                         self.errors.push(AnalyzeError {
-                            message: "array elements must have the same type".into(),
+                            kind: AnalyzeErrorKind::ArrayElementMismatch,
                         });
                     }
                 }
                 first_ty.map(|t| Type::Array(Box::new(t), elems.len()))
             }
             ExprKind::Index { array, index } => {
-                if let Some(arr_ty) = self.check_expr(array) {
+                if let Some(arr_ty) = self.type_check_expr(array) {
                     match arr_ty {
                         Type::Array(elem_ty, _) => {
-                            if let Some(idx_ty) = self.check_expr(index)
+                            if let Some(idx_ty) = self.type_check_expr(index)
                                 && idx_ty != Type::U8
                             {
                                 self.errors.push(AnalyzeError {
-                                    message: format!("array index must be u8, found {:?}", idx_ty),
+                                    kind: AnalyzeErrorKind::ArrayIndexNotU8(idx_ty),
                                 });
                             }
                             Some(*elem_ty)
                         }
                         _ => {
                             self.errors.push(AnalyzeError {
-                                message: format!("cannot index into {:?}", arr_ty),
+                                kind: AnalyzeErrorKind::CannotIndex(arr_ty),
                             });
                             None
                         }
                     }
                 } else {
-                    self.check_expr(index);
+                    self.type_check_expr(index);
                     None
                 }
             }
         }
     }
 
-    fn check_stmt(&mut self, stmt: &Stmt) {
+    fn type_check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
-                if let Some(vt) = self.check_expr(value)
+                if let Some(vt) = self.type_check_expr(value)
                     && !Self::types_compatible(ty, &vt)
                 {
                     self.errors.push(AnalyzeError {
-                        message: format!("type mismatch in let: expected {:?}, found {:?}", ty, vt),
+                        kind: AnalyzeErrorKind::TypeMismatch {
+                            context: "type mismatch in let",
+                            expected: ty.clone(),
+                            found: vt,
+                        },
                     });
                 }
                 self.insert_local(name.clone(), ty.clone());
             }
             StmtKind::Assign { name, value } => {
                 let var_ty = self.lookup_var(name);
-                let val_ty = self.check_expr(value);
+                let val_ty = self.type_check_expr(value);
                 match (var_ty, val_ty) {
                     (None, _) => {
                         self.errors.push(AnalyzeError {
-                            message: format!("undefined variable: '{name}'"),
+                            kind: AnalyzeErrorKind::UndefinedVariable(name.clone()),
                         });
                     }
                     (Some(vt), Some(et)) => {
                         if !Self::types_compatible(&vt, &et) {
                             self.errors.push(AnalyzeError {
-                                message: format!(
-                                    "assignment type mismatch: expected {:?}, found {:?}",
-                                    vt, et
-                                ),
+                                kind: AnalyzeErrorKind::AssignmentTypeMismatch {
+                                    expected: vt,
+                                    found: et,
+                                },
                             });
                         }
                     }
@@ -500,11 +595,11 @@ impl Analyzer {
                 }
             }
             StmtKind::Expr(expr) => {
-                self.check_expr(expr);
+                self.type_check_expr(expr);
             }
             StmtKind::Return(expr) => {
                 let ret_ty = if let Some(e) = expr {
-                    self.check_expr(e)
+                    self.type_check_expr(e)
                 } else {
                     Some(Type::Unit)
                 };
@@ -512,17 +607,18 @@ impl Analyzer {
                     && !Self::types_compatible(expected, actual)
                 {
                     self.errors.push(AnalyzeError {
-                        message: format!(
-                            "return type mismatch: expected {:?}, found {:?}",
-                            expected, actual
-                        ),
+                        kind: AnalyzeErrorKind::TypeMismatch {
+                            context: "return type mismatch",
+                            expected: expected.clone(),
+                            found: actual.clone(),
+                        },
                     });
                 }
             }
             StmtKind::Break => {
                 if self.loop_depth == 0 {
                     self.errors.push(AnalyzeError {
-                        message: "break outside of loop".into(),
+                        kind: AnalyzeErrorKind::BreakOutsideLoop,
                     });
                 }
             }
