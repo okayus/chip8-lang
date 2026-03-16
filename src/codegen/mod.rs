@@ -41,6 +41,8 @@ struct Patch {
 enum PatchKind {
     /// 関数呼び出し (CALL addr)
     Call(String),
+    /// グローバル変数のアドレス (LD I, addr)
+    GlobalAddr(String),
 }
 
 impl CodeGen {
@@ -133,7 +135,15 @@ impl CodeGen {
             self.bytes[main_jp_offset + 1] = lo;
         }
 
-        // CALL パッチを解決
+        // グローバルデータのアドレスを確定
+        let data_base = PROGRAM_START + self.bytes.len() as u16;
+        let global_addrs = self.global_addrs.clone();
+        for (name, offset) in &global_addrs {
+            let addr = data_base + *offset;
+            self.global_addrs.insert(name.clone(), addr);
+        }
+
+        // パッチを解決 (CALL + GlobalAddr)
         let patches = std::mem::take(&mut self.patches);
         for patch in &patches {
             match &patch.kind {
@@ -145,15 +155,15 @@ impl CodeGen {
                         self.bytes[patch.offset + 1] = lo;
                     }
                 }
+                PatchKind::GlobalAddr(name) => {
+                    if let Some(&addr) = self.global_addrs.get(name) {
+                        let hi = 0xA0 | ((addr >> 8) as u8 & 0x0F); // LD I = ANNN
+                        let lo = (addr & 0xFF) as u8;
+                        self.bytes[patch.offset] = hi;
+                        self.bytes[patch.offset + 1] = lo;
+                    }
+                }
             }
-        }
-
-        // グローバルデータのアドレスを確定
-        let data_base = PROGRAM_START + self.bytes.len() as u16;
-        let global_addrs = self.global_addrs.clone();
-        for (name, offset) in &global_addrs {
-            let addr = data_base + *offset;
-            self.global_addrs.insert(name.clone(), addr);
         }
 
         // バイトコード + データを結合
@@ -190,33 +200,34 @@ impl CodeGen {
         self.local_regs.values().any(|&r| r == 0)
     }
 
+    /// LD I, addr をパッチ予約付きで emit する
+    fn emit_ld_i_global(&mut self, name: &str) {
+        let offset = self.bytes.len();
+        self.emit(0xA0, 0x00); // placeholder: LD I, 0x000
+        self.patches.push(Patch {
+            offset,
+            kind: PatchKind::GlobalAddr(name.to_string()),
+        });
+    }
+
     /// グローバル変数を安全に読み込む (F065 のみ使用し、V0 を保護)
     /// addr のメモリから1バイトを target_reg に読み込む
-    fn emit_global_read(&mut self, addr: u16, target_reg: u8) {
+    fn emit_global_read(&mut self, _addr: u16, target_reg: u8, name: &str) {
         if target_reg == 0 {
-            // ターゲットが V0 なら直接読み込み
-            // LD I, addr (ANNN)
-            self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
-            // LD V0, [I] (F065)
-            self.emit(0xF0, 0x65);
+            self.emit_ld_i_global(name);
+            self.emit(0xF0, 0x65); // LD V0, [I]
         } else if self.v0_is_bound() {
-            // V0 がローカル変数に使われている場合: V0 を退避・復帰
-            // 退避用のスクラッチアドレスとして I の現在値を利用
-            // V0 の値を target_reg に一時退避
-            self.emit(0x80 | target_reg, 0x00); // LD Vtarget, V0 (8X00)
-            // グローバル変数を V0 に読み込み
-            self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
-            self.emit(0xF0, 0x65); // LD V0, [I] (F065)
-            // V0 の値 (グローバル変数) と target_reg の値 (元V0) を交換
-            // XOR swap: a^=b; b^=a; a^=b
-            self.emit(0x80 | target_reg, 0x03); // XOR Vtarget, V0
-            self.emit(0x80, (target_reg << 4) | 0x03); // XOR V0, Vtarget
-            self.emit(0x80 | target_reg, 0x03); // XOR Vtarget, V0
+            self.emit(0x80 | target_reg, 0x00); // LD Vtarget, V0
+            self.emit_ld_i_global(name);
+            self.emit(0xF0, 0x65); // LD V0, [I]
+            // XOR swap
+            self.emit(0x80 | target_reg, 0x03);
+            self.emit(0x80, (target_reg << 4) | 0x03);
+            self.emit(0x80 | target_reg, 0x03);
         } else {
-            // V0 は未使用: 直接 F065 で読み込み、V0 → target にコピー
-            self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
-            self.emit(0xF0, 0x65); // LD V0, [I] (F065)
-            self.emit(0x80 | target_reg, 0x00); // LD Vtarget, V0 (8X00)
+            self.emit_ld_i_global(name);
+            self.emit(0xF0, 0x65); // LD V0, [I]
+            self.emit(0x80 | target_reg, 0x00); // LD Vtarget, V0
         }
     }
 
@@ -243,7 +254,7 @@ impl CodeGen {
                     // グローバル変数: F065 (V0のみロード) を使って安全に読み込み
                     let reg = self.alloc_temp_reg();
                     if let Some(&addr) = self.global_addrs.get(name) {
-                        self.emit_global_read(addr, reg);
+                        self.emit_global_read(addr, reg, name);
                     }
                     Some(reg)
                 }
@@ -436,17 +447,11 @@ impl CodeGen {
                     }
                     "draw" => {
                         // draw(sprite_name, x, y)
-                        // I にスプライトのアドレスを設定済みのはず
                         // args[0] はスプライト変数名
                         if args.len() == 3 {
-                            // スプライトのアドレスを I にセット
+                            // スプライトのアドレスを I にセット (パッチ予約)
                             if let ExprKind::Ident(sprite_name) = &args[0].kind {
-                                if let Some(&addr) = self.global_addrs.get(sprite_name) {
-                                    self.emit(
-                                        0xA0 | ((addr >> 8) as u8 & 0x0F),
-                                        (addr & 0xFF) as u8,
-                                    );
-                                }
+                                self.emit_ld_i_global(sprite_name);
                                 let n =
                                     self.sprite_sizes.get(sprite_name).copied().unwrap_or(1) as u8;
                                 let x_reg = arg_regs[1];
@@ -471,10 +476,10 @@ impl CodeGen {
                     "is_key_pressed" => {
                         let key_reg = arg_regs[0];
                         let res = self.alloc_temp_reg();
-                        self.emit(0x60 | res, 0); // LD res, 0
-                        // EX9E: skip if key pressed
+                        self.emit(0x60 | res, 1); // LD res, 1 (assume pressed)
+                        // EX9E: skip next if key IS pressed → keep res=1
                         self.emit(0xE0 | key_reg, 0x9E);
-                        self.emit(0x60 | res, 1); // LD res, 1
+                        self.emit(0x60 | res, 0); // LD res, 0 (not pressed)
                         Some(res)
                     }
                     "delay" => {
@@ -551,7 +556,7 @@ impl CodeGen {
                 let cond_reg = self.gen_expr(cond)?;
                 // SE cond, 1 → skip if true
                 // if cond is false (0), skip then block
-                self.emit(0x30 | cond_reg, 0x00); // SE Vx, 0 → skip if false
+                self.emit(0x40 | cond_reg, 0x00); // SNE Vx, 0 → skip JP when cond is true
                 let jp_else_offset = self.bytes.len();
                 self.emit(0x00, 0x00); // JP else (placeholder)
 
@@ -629,15 +634,12 @@ impl CodeGen {
             ExprKind::Index { array, index } => {
                 // 配列アクセス: I + index でメモリから読み込み
                 if let ExprKind::Ident(name) = &array.kind
-                    && let Some(&base_addr) = self.global_addrs.get(name)
+                    && self.global_addrs.contains_key(name)
                 {
                     let idx_reg = self.gen_expr(index)?;
                     let result_reg = self.alloc_temp_reg();
-                    // I = base_addr
-                    self.emit(
-                        0xA0 | ((base_addr >> 8) as u8 & 0x0F),
-                        (base_addr & 0xFF) as u8,
-                    );
+                    // I = base_addr (パッチ予約)
+                    self.emit_ld_i_global(name);
                     // I += idx_reg (FX1E: ADD I, Vx)
                     self.emit(0xF0 | idx_reg, 0x1E);
                     // 安全に V0 経由で読み込み (F065 のみ使用)
