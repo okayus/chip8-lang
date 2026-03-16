@@ -1,0 +1,13 @@
+-- hello.ch8l: 画面に数字を表示する最小サンプル
+
+let digit_sprite: sprite(1) = [0b11110000];
+
+fn main() -> () {
+  clear();
+  -- 画面中央付近に数字スプライトを描画
+  let x: u8 = 28;
+  let y: u8 = 14;
+  draw(digit_sprite, x, y);
+  -- キー入力待ちで停止
+  let k: u8 = wait_key();
+}
