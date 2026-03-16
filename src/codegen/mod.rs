@@ -21,6 +21,8 @@ pub struct CodeGen {
     local_regs: HashMap<String, u8>,
     /// 次に使えるレジスタ番号
     next_reg: u8,
+    /// ローカル変数にバインドされたレジスタの上限 (temp レジスタリセット用)
+    bound_reg_count: u8,
     /// パッチが必要なアドレス (forward reference)
     patches: Vec<Patch>,
     /// break 時にパッチするアドレスのスタック
@@ -51,6 +53,7 @@ impl CodeGen {
             sprite_sizes: HashMap::new(),
             local_regs: HashMap::new(),
             next_reg: 0,
+            bound_reg_count: 0,
             patches: Vec::new(),
             break_patches: Vec::new(),
         }
@@ -105,12 +108,14 @@ impl CodeGen {
                 // ローカルスコープ
                 self.local_regs.clear();
                 self.next_reg = 0;
+                self.bound_reg_count = 0;
 
                 // 引数をレジスタに割り当て
                 for param in params {
                     let reg = self.alloc_reg();
                     self.local_regs.insert(param.name.clone(), reg);
                 }
+                self.bound_reg_count = self.next_reg;
 
                 // 本体を生成
                 self.gen_expr(body);
@@ -180,6 +185,41 @@ impl CodeGen {
         self.local_regs.get(name).copied()
     }
 
+    /// V0 がローカル変数にバインドされているかチェック
+    fn v0_is_bound(&self) -> bool {
+        self.local_regs.values().any(|&r| r == 0)
+    }
+
+    /// グローバル変数を安全に読み込む (F065 のみ使用し、V0 を保護)
+    /// addr のメモリから1バイトを target_reg に読み込む
+    fn emit_global_read(&mut self, addr: u16, target_reg: u8) {
+        if target_reg == 0 {
+            // ターゲットが V0 なら直接読み込み
+            // LD I, addr (ANNN)
+            self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
+            // LD V0, [I] (F065)
+            self.emit(0xF0, 0x65);
+        } else if self.v0_is_bound() {
+            // V0 がローカル変数に使われている場合: V0 を退避・復帰
+            // 退避用のスクラッチアドレスとして I の現在値を利用
+            // V0 の値を target_reg に一時退避
+            self.emit(0x80 | target_reg, 0x00); // LD Vtarget, V0 (8X00)
+            // グローバル変数を V0 に読み込み
+            self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
+            self.emit(0xF0, 0x65); // LD V0, [I] (F065)
+            // V0 の値 (グローバル変数) と target_reg の値 (元V0) を交換
+            // XOR swap: a^=b; b^=a; a^=b
+            self.emit(0x80 | target_reg, 0x03); // XOR Vtarget, V0
+            self.emit(0x80, (target_reg << 4) | 0x03); // XOR V0, Vtarget
+            self.emit(0x80 | target_reg, 0x03); // XOR Vtarget, V0
+        } else {
+            // V0 は未使用: 直接 F065 で読み込み、V0 → target にコピー
+            self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
+            self.emit(0xF0, 0x65); // LD V0, [I] (F065)
+            self.emit(0x80 | target_reg, 0x00); // LD Vtarget, V0 (8X00)
+        }
+    }
+
     // ---- コード生成 ----
 
     fn gen_expr(&mut self, expr: &Expr) -> Option<u8> {
@@ -200,13 +240,10 @@ impl CodeGen {
                 if let Some(reg) = self.get_reg(name) {
                     Some(reg)
                 } else {
-                    // グローバル変数: I レジスタ経由で読み込み
+                    // グローバル変数: F065 (V0のみロード) を使って安全に読み込み
                     let reg = self.alloc_temp_reg();
                     if let Some(&addr) = self.global_addrs.get(name) {
-                        // LD I, addr (ANNN)
-                        self.emit(0xA0 | ((addr >> 8) as u8 & 0x0F), (addr & 0xFF) as u8);
-                        // LD Vx, [I] (FX65) - 1バイト読み込み
-                        self.emit(0xF0 | reg, 0x65);
+                        self.emit_global_read(addr, reg);
                     }
                     Some(reg)
                 }
@@ -377,8 +414,15 @@ impl CodeGen {
             }
             ExprKind::Call { name, args } => {
                 // 引数をレジスタに配置
+                // draw() の場合、args[0] はスプライト名なので評価をスキップ
+                let is_draw = name == "draw";
                 let mut arg_regs = Vec::new();
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
+                    if is_draw && i == 0 {
+                        // draw のスプライト引数は名前参照のみ、評価不要
+                        arg_regs.push(0); // placeholder
+                        continue;
+                    }
                     if let Some(reg) = self.gen_expr(arg) {
                         arg_regs.push(reg);
                     }
@@ -596,8 +640,20 @@ impl CodeGen {
                     );
                     // I += idx_reg (FX1E: ADD I, Vx)
                     self.emit(0xF0 | idx_reg, 0x1E);
-                    // LD V0, [I] (FX65)
-                    self.emit(0xF0 | result_reg, 0x65);
+                    // 安全に V0 経由で読み込み (F065 のみ使用)
+                    if result_reg == 0 {
+                        self.emit(0xF0, 0x65); // LD V0, [I]
+                    } else if self.v0_is_bound() {
+                        // V0 退避 → 読み込み → XOR swap
+                        self.emit(0x80 | result_reg, 0x00); // LD Vresult, V0
+                        self.emit(0xF0, 0x65); // LD V0, [I]
+                        self.emit(0x80 | result_reg, 0x03); // XOR
+                        self.emit(0x80, (result_reg << 4) | 0x03);
+                        self.emit(0x80 | result_reg, 0x03);
+                    } else {
+                        self.emit(0xF0, 0x65); // LD V0, [I]
+                        self.emit(0x80 | result_reg, 0x00); // LD Vresult, V0
+                    }
                     return Some(result_reg);
                 }
                 None
@@ -609,12 +665,17 @@ impl CodeGen {
         match &stmt.kind {
             StmtKind::Let { name, value, .. } => {
                 if let Some(val_reg) = self.gen_expr(value) {
+                    // temp レジスタをリセット (bound の直後から再開)
+                    self.next_reg = self.bound_reg_count;
                     let reg = self.alloc_reg();
                     if val_reg != reg {
                         // LD reg, val_reg (8XY0)
                         self.emit(0x80 | reg, val_reg << 4);
                     }
                     self.local_regs.insert(name.clone(), reg);
+                    // 新しいバインド変数を反映
+                    self.bound_reg_count = self.next_reg;
+                    return; // early return: next_reg は bound_reg_count に設定済み
                 }
             }
             StmtKind::Assign { name, value } => {
@@ -647,6 +708,10 @@ impl CodeGen {
                 }
             }
         }
+
+        // 文の終了後、temp レジスタをリセット
+        // bound_reg_count より上のレジスタは再利用可能
+        self.next_reg = self.bound_reg_count;
     }
 }
 
