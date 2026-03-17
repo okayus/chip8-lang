@@ -7,18 +7,21 @@ use crate::parser::ast::*;
 const INSTRUCTION_SIZE: u16 = 2;
 
 /// コード生成した値の所在
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ValueLocation {
     /// 値はレジスタに格納されている
     InRegister(Register),
+    /// struct の値: 連続レジスタに格納
+    InRegisters(Vec<Register>),
     /// 値を生成しない式 (loop, 配列リテラルなど)
     Void,
 }
 
 impl ValueLocation {
-    fn register(self) -> Option<Register> {
+    fn register(&self) -> Option<Register> {
         match self {
-            ValueLocation::InRegister(r) => Some(r),
+            ValueLocation::InRegister(r) => Some(*r),
+            ValueLocation::InRegisters(regs) => regs.first().copied(),
             ValueLocation::Void => None,
         }
     }
@@ -42,6 +45,18 @@ enum ForwardRefKind {
     GlobalAddr(String),
 }
 
+/// ローカル変数のバインディング情報
+#[derive(Clone)]
+enum LocalBinding {
+    /// スカラー値 (u8, bool, enum)
+    Single(UserRegister),
+    /// struct 値: base レジスタと struct 名
+    Struct {
+        base_reg: UserRegister,
+        struct_name: String,
+    },
+}
+
 /// コード生成器
 ///
 /// AST を走査して CHIP-8 バイトコードを生成する。
@@ -61,10 +76,12 @@ pub struct CodeGen {
     sprite_sizes: HashMap<String, usize>,
     /// enum variant → u8 値
     enum_variant_values: HashMap<(String, String), u8>,
+    /// struct 定義 (名前 → フィールド定義リスト)
+    struct_defs: HashMap<String, Vec<StructField>>,
     /// レジスタ退避用の次のスロットアドレス
     next_save_slot: u16,
-    /// ローカル変数名 → 割り当て済みレジスタ
-    local_bindings: HashMap<String, UserRegister>,
+    /// ローカル変数名 → 割り当て済みバインディング
+    local_bindings: HashMap<String, LocalBinding>,
     /// 次に割り当て可能なレジスタ番号
     next_free_reg: u8,
     /// ローカル変数にバインド済みのレジスタ数 (一時レジスタのリセット基準)
@@ -91,6 +108,7 @@ impl CodeGen {
             resolved_addrs: HashMap::new(),
             sprite_sizes: HashMap::new(),
             enum_variant_values: HashMap::new(),
+            struct_defs: HashMap::new(),
             next_save_slot: 0x0A0,
             local_bindings: HashMap::new(),
             next_free_reg: 0,
@@ -105,13 +123,19 @@ impl CodeGen {
 
     /// プログラム全体をコード生成し、バイトコードを返す
     pub fn generate(&mut self, program: &Program) -> Vec<u8> {
-        // Pass 0: enum 定義を登録
+        // Pass 0: enum / struct 定義を登録
         for top in &program.top_levels {
-            if let TopLevel::EnumDef { name, variants, .. } = top {
-                for (i, variant) in variants.iter().enumerate() {
-                    self.enum_variant_values
-                        .insert((name.clone(), variant.clone()), i as u8);
+            match top {
+                TopLevel::EnumDef { name, variants, .. } => {
+                    for (i, variant) in variants.iter().enumerate() {
+                        self.enum_variant_values
+                            .insert((name.clone(), variant.clone()), i as u8);
+                    }
                 }
+                TopLevel::StructDef { name, fields, .. } => {
+                    self.struct_defs.insert(name.clone(), fields.clone());
+                }
+                _ => {}
             }
         }
 
@@ -161,8 +185,27 @@ impl CodeGen {
                 self.local_var_count = 0;
 
                 for param in params {
+                    if let Type::UserType(ref type_name) = param.ty
+                        && self.struct_defs.contains_key(type_name)
+                    {
+                        let base_reg = self.alloc_register();
+                        let count = self.struct_field_count(type_name);
+                        // 追加の連続レジスタを確保
+                        for _ in 1..count {
+                            self.alloc_register();
+                        }
+                        self.local_bindings.insert(
+                            param.name.clone(),
+                            LocalBinding::Struct {
+                                base_reg,
+                                struct_name: type_name.clone(),
+                            },
+                        );
+                        continue;
+                    }
                     let reg = self.alloc_register();
-                    self.local_bindings.insert(param.name.clone(), reg);
+                    self.local_bindings
+                        .insert(param.name.clone(), LocalBinding::Single(reg));
                 }
                 self.local_var_count = self.next_free_reg;
 
@@ -262,12 +305,89 @@ impl CodeGen {
         self.alloc_register()
     }
 
-    fn lookup_register(&self, name: &str) -> Option<UserRegister> {
-        self.local_bindings.get(name).copied()
+    fn lookup_binding(&self, name: &str) -> Option<&LocalBinding> {
+        self.local_bindings.get(name)
     }
 
     fn v0_is_bound(&self) -> bool {
-        self.local_bindings.values().any(|r| r.index() == 0)
+        self.local_bindings.values().any(|b| match b {
+            LocalBinding::Single(r) => r.index() == 0,
+            LocalBinding::Struct { base_reg, .. } => base_reg.index() == 0,
+        })
+    }
+
+    /// struct のフラット化フィールド数を計算
+    fn struct_field_count(&self, struct_name: &str) -> usize {
+        if let Some(fields) = self.struct_defs.get(struct_name) {
+            fields
+                .iter()
+                .map(|f| {
+                    if let Type::UserType(ref name) = f.ty
+                        && self.struct_defs.contains_key(name)
+                    {
+                        return self.struct_field_count(name);
+                    }
+                    1
+                })
+                .sum()
+        } else {
+            1
+        }
+    }
+
+    /// struct 内のフィールドのレジスタオフセットを計算
+    fn struct_field_offset(&self, struct_name: &str, field_name: &str) -> Option<usize> {
+        let fields = self.struct_defs.get(struct_name)?;
+        let mut offset = 0;
+        for f in fields {
+            if f.name == field_name {
+                return Some(offset);
+            }
+            if let Type::UserType(ref name) = f.ty
+                && self.struct_defs.contains_key(name)
+            {
+                offset += self.struct_field_count(name);
+                continue;
+            }
+            offset += 1;
+        }
+        None
+    }
+
+    /// struct のフィールドの型を取得
+    fn struct_field_type(&self, struct_name: &str, field_name: &str) -> Option<Type> {
+        let fields = self.struct_defs.get(struct_name)?;
+        fields
+            .iter()
+            .find(|f| f.name == field_name)
+            .map(|f| f.ty.clone())
+    }
+
+    /// 式から struct 名を推定
+    fn infer_struct_name(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => {
+                if let Some(LocalBinding::Struct { struct_name, .. }) = self.lookup_binding(name) {
+                    Some(struct_name.clone())
+                } else {
+                    None
+                }
+            }
+            ExprKind::StructLiteral { name, .. } => Some(name.clone()),
+            ExprKind::FieldAccess {
+                expr: inner, field, ..
+            } => {
+                let parent_name = self.infer_struct_name(inner)?;
+                if let Some(field_ty) = self.struct_field_type(&parent_name, field)
+                    && let Type::UserType(name) = field_ty
+                    && self.struct_defs.contains_key(&name)
+                {
+                    return Some(name);
+                }
+                None
+            }
+            _ => None,
+        }
     }
 
     fn emit_ld_i_global(&mut self, name: &str) {
@@ -404,8 +524,22 @@ impl CodeGen {
                 ValueLocation::InRegister(reg.into())
             }
             ExprKind::Ident(name) => {
-                if let Some(reg) = self.lookup_register(name) {
-                    ValueLocation::InRegister(reg.into())
+                if let Some(binding) = self.lookup_binding(name).cloned() {
+                    match binding {
+                        LocalBinding::Single(reg) => ValueLocation::InRegister(reg.into()),
+                        LocalBinding::Struct {
+                            base_reg,
+                            ref struct_name,
+                        } => {
+                            let count = self.struct_field_count(struct_name);
+                            let regs: Vec<Register> = (0..count)
+                                .map(|i| {
+                                    Register::from(UserRegister::new(base_reg.index() + i as u8))
+                                })
+                                .collect();
+                            ValueLocation::InRegisters(regs)
+                        }
+                    }
                 } else {
                     let reg = self.alloc_temp_register();
                     if self.data_offsets.contains_key(name) {
@@ -680,6 +814,127 @@ impl CodeGen {
                 self.emit_op(Opcode::LdImm(reg.into(), val));
                 ValueLocation::InRegister(reg.into())
             }
+            ExprKind::StructLiteral { name, fields, base } => {
+                let field_count = self.struct_field_count(name);
+                let struct_fields = self.struct_defs.get(name).cloned().unwrap_or_default();
+
+                // 結果用の連続レジスタを確保
+                let base_reg = self.alloc_temp_register();
+                for _ in 1..field_count {
+                    self.alloc_temp_register();
+                }
+                let result_regs: Vec<Register> = (0..field_count)
+                    .map(|i| UserRegister::new(base_reg.index() + i as u8).into())
+                    .collect();
+
+                // base がある場合、先にコピー
+                if let Some(base_expr) = base {
+                    let base_loc = self.codegen_expr(base_expr);
+                    if let ValueLocation::InRegisters(ref src_regs) = base_loc {
+                        for (i, &src) in src_regs.iter().enumerate() {
+                            if i < result_regs.len() && src != result_regs[i] {
+                                self.emit_op(Opcode::LdReg(result_regs[i], src));
+                            }
+                        }
+                    }
+                }
+
+                // 各フィールドの値を該当するレジスタに設定
+                for (field_name, value_expr) in fields {
+                    if let Some(offset) = self.struct_field_offset(name, field_name) {
+                        // フィールドが struct 型の場合
+                        let field_ty = struct_fields
+                            .iter()
+                            .find(|f| &f.name == field_name)
+                            .map(|f| &f.ty);
+                        if let Some(Type::UserType(sub_name)) = field_ty
+                            && self.struct_defs.contains_key(sub_name)
+                        {
+                            let val_loc = self.codegen_expr(value_expr);
+                            if let ValueLocation::InRegisters(ref src_regs) = val_loc {
+                                let sub_count = self.struct_field_count(sub_name);
+                                for i in 0..sub_count.min(src_regs.len()) {
+                                    if src_regs[i] != result_regs[offset + i] {
+                                        self.emit_op(Opcode::LdReg(
+                                            result_regs[offset + i],
+                                            src_regs[i],
+                                        ));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        // スカラーフィールド
+                        if let Some(val_reg) = self.codegen_expr(value_expr).register()
+                            && val_reg != result_regs[offset]
+                        {
+                            self.emit_op(Opcode::LdReg(result_regs[offset], val_reg));
+                        }
+                    }
+                }
+
+                ValueLocation::InRegisters(result_regs)
+            }
+            ExprKind::FieldAccess { expr: inner, field } => {
+                let inner_loc = self.codegen_expr(inner);
+                match inner_loc {
+                    ValueLocation::InRegisters(ref regs) => {
+                        // inner の型から struct 名を推定する必要がある
+                        // Ident の場合は local_bindings から取得
+                        let struct_name = self.infer_struct_name(inner);
+                        if let Some(ref sn) = struct_name
+                            && let Some(offset) = self.struct_field_offset(sn, field)
+                        {
+                            // フィールドが struct の場合、複数レジスタを返す
+                            if let Some(field_ty) = self.struct_field_type(sn, field)
+                                && let Type::UserType(ref sub_name) = field_ty
+                                && self.struct_defs.contains_key(sub_name)
+                            {
+                                let sub_count = self.struct_field_count(sub_name);
+                                let sub_regs: Vec<Register> =
+                                    (0..sub_count).map(|i| regs[offset + i]).collect();
+                                return ValueLocation::InRegisters(sub_regs);
+                            }
+                            if offset < regs.len() {
+                                return ValueLocation::InRegister(regs[offset]);
+                            }
+                        }
+                        ValueLocation::Void
+                    }
+                    _ => {
+                        // single register binding for struct (lookup from local bindings)
+                        if let ExprKind::Ident(name) = &inner.kind
+                            && let Some(LocalBinding::Struct {
+                                base_reg,
+                                struct_name,
+                            }) = self.lookup_binding(name).cloned()
+                        {
+                            let count = self.struct_field_count(&struct_name);
+                            let regs: Vec<Register> = (0..count)
+                                .map(|i| {
+                                    Register::from(UserRegister::new(base_reg.index() + i as u8))
+                                })
+                                .collect();
+                            if let Some(offset) = self.struct_field_offset(&struct_name, field) {
+                                // フィールドが struct 型かチェック
+                                if let Some(field_ty) = self.struct_field_type(&struct_name, field)
+                                    && let Type::UserType(ref sub_name) = field_ty
+                                    && self.struct_defs.contains_key(sub_name)
+                                {
+                                    let sub_count = self.struct_field_count(sub_name);
+                                    let sub_regs: Vec<Register> =
+                                        (0..sub_count).map(|i| regs[offset + i]).collect();
+                                    return ValueLocation::InRegisters(sub_regs);
+                                }
+                                if offset < regs.len() {
+                                    return ValueLocation::InRegister(regs[offset]);
+                                }
+                            }
+                        }
+                        ValueLocation::Void
+                    }
+                }
+            }
             ExprKind::ArrayLiteral(_) => ValueLocation::Void,
             ExprKind::Index { array, index } => {
                 if let ExprKind::Ident(name) = &array.kind
@@ -855,24 +1110,57 @@ impl CodeGen {
 
     fn codegen_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
-            StmtKind::Let { name, value, .. } => {
-                if let Some(val_reg) = self.codegen_expr(value).register() {
+            StmtKind::Let { name, ty, value } => {
+                let val_loc = self.codegen_expr(value);
+                // struct 型の let: 連続レジスタをバインド
+                if let Type::UserType(type_name) = ty
+                    && self.struct_defs.contains_key(type_name)
+                    && let ValueLocation::InRegisters(ref regs) = val_loc
+                {
+                    let count = self.struct_field_count(type_name);
+                    self.next_free_reg = self.local_var_count;
+                    let base_reg = self.alloc_register();
+                    for _ in 1..count {
+                        self.alloc_register();
+                    }
+                    // 値をコピー
+                    for (i, &src_reg) in regs.iter().enumerate() {
+                        let dst: Register = UserRegister::new(base_reg.index() + i as u8).into();
+                        if src_reg != dst {
+                            self.emit_op(Opcode::LdReg(dst, src_reg));
+                        }
+                    }
+                    self.local_bindings.insert(
+                        name.clone(),
+                        LocalBinding::Struct {
+                            base_reg,
+                            struct_name: type_name.clone(),
+                        },
+                    );
+                    self.local_var_count = self.next_free_reg;
+                    return;
+                }
+                // スカラー型の let
+                if let Some(val_reg) = val_loc.register() {
                     self.next_free_reg = self.local_var_count;
                     let reg = self.alloc_register();
                     if val_reg != Register::from(reg) {
                         self.emit_op(Opcode::LdReg(reg.into(), val_reg));
                     }
-                    self.local_bindings.insert(name.clone(), reg);
+                    self.local_bindings
+                        .insert(name.clone(), LocalBinding::Single(reg));
                     self.local_var_count = self.next_free_reg;
                     return;
                 }
             }
             StmtKind::Assign { name, value } => {
                 if let Some(val_reg) = self.codegen_expr(value).register()
-                    && let Some(&target_reg) = self.local_bindings.get(name)
-                    && val_reg != Register::from(target_reg)
+                    && let Some(LocalBinding::Single(target_reg)) = self.local_bindings.get(name)
                 {
-                    self.emit_op(Opcode::LdReg(target_reg.into(), val_reg));
+                    let target: Register = (*target_reg).into();
+                    if val_reg != target {
+                        self.emit_op(Opcode::LdReg(target, val_reg));
+                    }
                 }
             }
             StmtKind::Expr(expr) => {

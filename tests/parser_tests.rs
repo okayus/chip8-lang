@@ -555,3 +555,106 @@ fn test_random_enum_parses_as_builtin_call() {
         _ => panic!("expected FnDef"),
     }
 }
+
+#[test]
+fn test_struct_def() {
+    let prog = parse("struct Pos { x: u8, y: u8 }");
+    assert_eq!(prog.top_levels.len(), 1);
+    match &prog.top_levels[0] {
+        TopLevel::StructDef { name, fields, .. } => {
+            assert_eq!(name, "Pos");
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name, "x");
+            assert_eq!(fields[0].ty, Type::U8);
+            assert_eq!(fields[1].name, "y");
+            assert_eq!(fields[1].ty, Type::U8);
+        }
+        _ => panic!("expected StructDef"),
+    }
+}
+
+#[test]
+fn test_struct_literal() {
+    let prog = parse(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> Pos { Pos { x: 10, y: 20 } }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                if let ExprKind::StructLiteral { name, fields, base } = &tail.kind {
+                    assert_eq!(name, "Pos");
+                    assert_eq!(fields.len(), 2);
+                    assert_eq!(fields[0].0, "x");
+                    assert_eq!(fields[1].0, "y");
+                    assert!(base.is_none());
+                } else {
+                    panic!("expected StructLiteral, got {:?}", tail.kind);
+                }
+            } else {
+                panic!("expected Block with tail expr");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
+fn test_field_access() {
+    let prog = parse(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> u8 {
+            let p: Pos = Pos { x: 1, y: 2 };
+            p.x
+         }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                assert!(matches!(
+                    &tail.kind,
+                    ExprKind::FieldAccess { field, .. } if field == "x"
+                ));
+            } else {
+                panic!("expected Block with tail expr");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
+fn test_struct_update_syntax() {
+    let prog = parse(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> Pos {
+            let p: Pos = Pos { x: 1, y: 2 };
+            Pos { ..p, x: 10 }
+         }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                if let ExprKind::StructLiteral { base, fields, .. } = &tail.kind {
+                    assert!(base.is_some());
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].0, "x");
+                } else {
+                    panic!("expected StructLiteral");
+                }
+            } else {
+                panic!("expected Block with tail expr");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}

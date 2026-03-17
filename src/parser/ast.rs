@@ -8,7 +8,7 @@ pub enum Type {
     Unit,
     Array(Box<Type>, usize),
     Sprite(usize),
-    UserEnum(String),
+    UserType(String),
 }
 
 /// 二項演算子
@@ -91,6 +91,15 @@ pub enum ExprKind {
         enum_name: String,
         variant: String,
     },
+    StructLiteral {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        base: Option<Box<Expr>>,
+    },
+    FieldAccess {
+        expr: Box<Expr>,
+        field: String,
+    },
 }
 
 /// match 式のアーム
@@ -114,6 +123,13 @@ pub enum StmtKind {
     Expr(Expr),
     Return(Option<Expr>),
     Break,
+}
+
+/// struct のフィールド定義
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructField {
+    pub name: String,
+    pub ty: Type,
 }
 
 /// 関数の引数
@@ -142,6 +158,11 @@ pub enum TopLevel {
     EnumDef {
         name: String,
         variants: Vec<String>,
+        span: Span,
+    },
+    StructDef {
+        name: String,
+        fields: Vec<StructField>,
         span: Span,
     },
 }

@@ -310,3 +310,16 @@ fn test_pipe_operator() {
     let ks = kinds("x |> f()");
     assert!(ks.contains(&TokenKind::Pipe));
 }
+
+#[test]
+fn test_struct_keyword_and_dot() {
+    let ks = kinds("struct Pos { x: u8 }");
+    assert!(ks.contains(&TokenKind::Struct));
+    assert!(ks.contains(&TokenKind::Colon));
+
+    let ks2 = kinds("p.x");
+    assert!(ks2.contains(&TokenKind::Dot));
+
+    let ks3 = kinds("Pos { ..base }");
+    assert!(ks3.contains(&TokenKind::DotDot));
+}

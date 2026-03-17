@@ -275,6 +275,7 @@ impl Lexer {
             "false" => TokenKind::False,
             "match" => TokenKind::Match,
             "enum" => TokenKind::Enum,
+            "struct" => TokenKind::Struct,
             _ => TokenKind::Ident(s),
         };
 
@@ -296,6 +297,14 @@ impl Lexer {
             '}' => TokenKind::RBrace,
             '[' => TokenKind::LBracket,
             ']' => TokenKind::RBracket,
+            '.' => {
+                if self.peek() == Some('.') {
+                    self.advance();
+                    TokenKind::DotDot
+                } else {
+                    TokenKind::Dot
+                }
+            }
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
             ':' => {

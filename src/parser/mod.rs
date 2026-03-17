@@ -70,6 +70,14 @@ impl Parser {
         &self.tokens[self.pos].kind
     }
 
+    fn peek_at(&self, offset: usize) -> &TokenKind {
+        if self.pos + offset < self.tokens.len() {
+            &self.tokens[self.pos + offset].kind
+        } else {
+            &TokenKind::Eof
+        }
+    }
+
     fn current_span(&self) -> Span {
         self.tokens[self.pos].span
     }
@@ -125,9 +133,10 @@ impl Parser {
             TokenKind::Fn => self.parse_fn_def(),
             TokenKind::Let => self.parse_let_def(),
             TokenKind::Enum => self.parse_enum_def(),
+            TokenKind::Struct => self.parse_struct_def(),
             _ => Err(ParseError {
                 kind: ParseErrorKind::UnexpectedToken {
-                    expected: "'fn', 'let', or 'enum'".to_string(),
+                    expected: "'fn', 'let', 'enum', or 'struct'".to_string(),
                     found: self.peek().clone(),
                 },
                 span: self.current_span(),
@@ -211,6 +220,28 @@ impl Parser {
         })
     }
 
+    fn parse_struct_def(&mut self) -> Result<TopLevel, ParseError> {
+        let span = self.current_span();
+        self.expect(&TokenKind::Struct)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        while self.peek() != &TokenKind::RBrace {
+            let (field_name, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ty = self.parse_type()?;
+            fields.push(StructField {
+                name: field_name,
+                ty,
+            });
+            if self.peek() == &TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(TopLevel::StructDef { name, fields, span })
+    }
+
     // ---- 型 ----
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -227,7 +258,7 @@ impl Parser {
                         self.expect(&TokenKind::RParen)?;
                         Ok(Type::Sprite(size as usize))
                     }
-                    _ => Ok(Type::UserEnum(name)),
+                    _ => Ok(Type::UserType(name)),
                 }
             }
             TokenKind::LParen => {
@@ -435,6 +466,17 @@ impl Parser {
                     },
                     span,
                 };
+            } else if self.peek() == &TokenKind::Dot {
+                let span = expr.span;
+                self.advance();
+                let (field, _) = self.expect_ident()?;
+                expr = Expr {
+                    kind: ExprKind::FieldAccess {
+                        expr: Box::new(expr),
+                        field,
+                    },
+                    span,
+                };
             } else {
                 break;
             }
@@ -479,6 +521,21 @@ impl Parser {
                         },
                         span,
                     });
+                }
+                // struct リテラル: Name { field: value, ... }
+                // 先読みで { Ident : ... } or { .. } or { } パターンを確認
+                if self.peek() == &TokenKind::LBrace {
+                    let is_struct_literal = match self.peek_at(1) {
+                        TokenKind::DotDot => true, // Name { ..base }
+                        TokenKind::Ident(_) => {
+                            // Name { field: ... } なら struct リテラル
+                            matches!(self.peek_at(2), TokenKind::Colon)
+                        }
+                        _ => false,
+                    };
+                    if is_struct_literal {
+                        return self.parse_struct_literal(name, span);
+                    }
                 }
                 // 関数呼び出し
                 if self.peek() == &TokenKind::LParen {
@@ -544,6 +601,35 @@ impl Parser {
                 span,
             }),
         }
+    }
+
+    fn parse_struct_literal(&mut self, name: String, span: Span) -> Result<Expr, ParseError> {
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        let mut base = None;
+        while self.peek() != &TokenKind::RBrace {
+            // struct update 構文: ..base
+            if self.peek() == &TokenKind::DotDot {
+                self.advance();
+                base = Some(Box::new(self.parse_expr()?));
+                if self.peek() == &TokenKind::Comma {
+                    self.advance();
+                }
+                continue;
+            }
+            let (field_name, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let value = self.parse_expr()?;
+            fields.push((field_name, value));
+            if self.peek() == &TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Expr {
+            kind: ExprKind::StructLiteral { name, fields, base },
+            span,
+        })
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
