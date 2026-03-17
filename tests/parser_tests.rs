@@ -236,6 +236,21 @@ fn test_function_call() {
 }
 
 #[test]
+fn test_custom_builtins_parse() {
+    let prog = parse("fn f() -> () { begin_draw_batch(); end_draw_batch(); let r: bool = is_key_just_pressed(5); }");
+    match &prog.top_levels[0] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block { stmts, .. } = &body.kind {
+                assert_eq!(stmts.len(), 3);
+            } else {
+                panic!("expected Block");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
 fn test_let_stmt() {
     let prog = parse("fn f() -> () { let x: u8 = 42; }");
     match &prog.top_levels[0] {

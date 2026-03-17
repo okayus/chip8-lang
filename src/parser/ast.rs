@@ -196,10 +196,16 @@ pub enum BuiltinFunction {
     Clear,
     /// draw(sprite, x, y) -> bool - スプライト描画 (DXYN)
     Draw,
+    /// begin_draw_batch() - 描画バッチ開始 (custom 00F0)
+    BeginDrawBatch,
+    /// end_draw_batch() - 描画バッチ終了 (custom 00F1)
+    EndDrawBatch,
     /// wait_key() -> u8 - キー入力待ち (FX0A)
     WaitKey,
     /// is_key_pressed(k: u8) -> bool - キー押下判定 (EX9E)
     IsKeyPressed,
+    /// is_key_just_pressed(k: u8) -> bool - キー押下エッジ判定 (custom EX9F)
+    IsKeyJustPressed,
     /// delay() -> u8 - ディレイタイマー読み取り (FX07)
     Delay,
     /// set_delay(v: u8) - ディレイタイマー設定 (FX15)
@@ -222,8 +228,11 @@ impl BuiltinFunction {
         match name {
             "clear" => Some(Self::Clear),
             "draw" => Some(Self::Draw),
+            "begin_draw_batch" => Some(Self::BeginDrawBatch),
+            "end_draw_batch" => Some(Self::EndDrawBatch),
             "wait_key" => Some(Self::WaitKey),
             "is_key_pressed" => Some(Self::IsKeyPressed),
+            "is_key_just_pressed" => Some(Self::IsKeyJustPressed),
             "delay" => Some(Self::Delay),
             "set_delay" => Some(Self::SetDelay),
             "set_sound" => Some(Self::SetSound),
@@ -240,8 +249,11 @@ impl BuiltinFunction {
         match self {
             Self::Clear => "clear",
             Self::Draw => "draw",
+            Self::BeginDrawBatch => "begin_draw_batch",
+            Self::EndDrawBatch => "end_draw_batch",
             Self::WaitKey => "wait_key",
             Self::IsKeyPressed => "is_key_pressed",
+            Self::IsKeyJustPressed => "is_key_just_pressed",
             Self::Delay => "delay",
             Self::SetDelay => "set_delay",
             Self::SetSound => "set_sound",
@@ -257,8 +269,11 @@ impl BuiltinFunction {
         match self {
             Self::Clear => (vec![], Type::Unit),
             Self::Draw => (vec![Type::Sprite(0), Type::U8, Type::U8], Type::Bool),
+            Self::BeginDrawBatch => (vec![], Type::Unit),
+            Self::EndDrawBatch => (vec![], Type::Unit),
             Self::WaitKey => (vec![], Type::U8),
             Self::IsKeyPressed => (vec![Type::U8], Type::Bool),
+            Self::IsKeyJustPressed => (vec![Type::U8], Type::Bool),
             Self::Delay => (vec![], Type::U8),
             Self::SetDelay => (vec![Type::U8], Type::Unit),
             Self::SetSound => (vec![Type::U8], Type::Unit),
