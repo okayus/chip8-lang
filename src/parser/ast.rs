@@ -178,6 +178,8 @@ pub enum BuiltinFunction {
     Bcd,
     /// draw_digit(v: u8, x: u8, y: u8) - フォント数字描画 (FX29 + DXYN)
     DrawDigit,
+    /// random_enum(EnumName) -> EnumName - enum のランダム生成
+    RandomEnum,
 }
 
 impl BuiltinFunction {
@@ -194,6 +196,7 @@ impl BuiltinFunction {
             "random" => Some(Self::Random),
             "bcd" => Some(Self::Bcd),
             "draw_digit" => Some(Self::DrawDigit),
+            "random_enum" => Some(Self::RandomEnum),
             _ => None,
         }
     }
@@ -211,6 +214,7 @@ impl BuiltinFunction {
             Self::Random => "random",
             Self::Bcd => "bcd",
             Self::DrawDigit => "draw_digit",
+            Self::RandomEnum => "random_enum",
         }
     }
 
@@ -227,6 +231,8 @@ impl BuiltinFunction {
             Self::Random => (vec![Type::U8], Type::U8),
             Self::Bcd => (vec![Type::U8], Type::Unit),
             Self::DrawDigit => (vec![Type::U8, Type::U8, Type::U8], Type::Unit),
+            // RandomEnum は analyzer で特殊処理されるためプレースホルダ
+            Self::RandomEnum => (vec![Type::U8], Type::U8),
         }
     }
 }

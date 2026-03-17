@@ -295,3 +295,33 @@ fn test_function_body_result_copied_to_v0() {
         "expected LD V0, VF before RET in function returning draw result"
     );
 }
+
+#[test]
+fn test_random_enum_generates_rnd() {
+    let bytes = compile(
+        "enum Piece { I, O, T, S, Z, L, J }
+         fn main() -> Piece { random_enum(Piece) }",
+    );
+    // RND 命令 (CXKK) が含まれること
+    let has_rnd = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0xC0);
+    assert!(has_rnd, "expected RND instruction for random_enum");
+}
+
+#[test]
+fn test_random_enum_power_of_two() {
+    // 4 バリアント (2の冪) → mask = 3, 拒否サンプリング不要
+    let bytes = compile(
+        "enum Dir { Up, Down, Left, Right }
+         fn main() -> Dir { random_enum(Dir) }",
+    );
+    let has_rnd = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0xC0);
+    assert!(has_rnd, "expected RND instruction for random_enum");
+    // RND Vx, 0x03 (mask = 3) が含まれるはず
+    let has_rnd_mask3 = bytes
+        .chunks(2)
+        .any(|c| (c[0] & 0xF0) == 0xC0 && c[1] == 0x03);
+    assert!(
+        has_rnd_mask3,
+        "expected RND with mask 0x03 for 4-variant enum"
+    );
+}

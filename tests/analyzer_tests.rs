@@ -463,3 +463,44 @@ fn test_unknown_type() {
         AnalyzeErrorKind::UnknownType("Foo".to_string()),
     );
 }
+
+#[test]
+fn test_random_enum_ok() {
+    analyze_ok(
+        "enum Piece { I, O, T, S, Z, L, J }
+         fn main() -> Piece { random_enum(Piece) }",
+    );
+}
+
+#[test]
+fn test_random_enum_returns_enum_type() {
+    // random_enum(Piece) の戻り値を Piece 型変数に代入できること
+    analyze_ok(
+        "enum Dir { Up, Down, Left, Right }
+         fn main() -> Dir {
+            let d: Dir = random_enum(Dir);
+            d
+         }",
+    );
+}
+
+#[test]
+fn test_random_enum_not_enum_name() {
+    analyze_err_kind(
+        "fn main() -> u8 { random_enum(Foo) }",
+        AnalyzeErrorKind::RandomEnumArgNotEnum("Foo".to_string()),
+    );
+}
+
+#[test]
+fn test_random_enum_wrong_arg_count() {
+    analyze_err_kind(
+        "enum A { X }
+         fn main() -> A { random_enum(A, A) }",
+        AnalyzeErrorKind::BuiltinArgCountMismatch {
+            builtin: BuiltinFunction::RandomEnum,
+            expected: 1,
+            found: 2,
+        },
+    );
+}

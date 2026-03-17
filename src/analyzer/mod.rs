@@ -91,6 +91,8 @@ pub enum AnalyzeErrorKind {
     },
     /// 不明な型名
     UnknownType(String),
+    /// random_enum の引数が enum 名でない
+    RandomEnumArgNotEnum(String),
 }
 
 /// 意味解析エラー
@@ -201,6 +203,9 @@ impl std::fmt::Display for AnalyzeError {
                 missing.join(", ")
             ),
             AnalyzeErrorKind::UnknownType(name) => write!(f, "unknown type: '{name}'"),
+            AnalyzeErrorKind::RandomEnumArgNotEnum(name) => {
+                write!(f, "random_enum argument must be an enum name, got '{name}'")
+            }
         }
     }
 }
@@ -475,6 +480,37 @@ impl Analyzer {
                 }
             }
             ExprKind::BuiltinCall { builtin, args } => {
+                // random_enum は引数が型名 (enum 名) なので特殊処理
+                if *builtin == BuiltinFunction::RandomEnum {
+                    if args.len() != 1 {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::BuiltinArgCountMismatch {
+                                builtin: *builtin,
+                                expected: 1,
+                                found: args.len(),
+                            },
+                        });
+                        return None;
+                    }
+                    if let ExprKind::Ident(name) = &args[0].kind {
+                        if self.enums.contains_key(name) {
+                            return Some(Type::UserEnum(name.clone()));
+                        } else {
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::RandomEnumArgNotEnum(name.clone()),
+                            });
+                            return None;
+                        }
+                    } else {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::RandomEnumArgNotEnum(
+                                "<non-identifier>".to_string(),
+                            ),
+                        });
+                        return None;
+                    }
+                }
+
                 let (param_types, return_type) = builtin.signature();
                 if args.len() != param_types.len() {
                     self.errors.push(AnalyzeError {
