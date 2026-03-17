@@ -391,15 +391,27 @@ impl Analyzer {
                         });
                     }
 
-                    if let Some(scope) = self.locals.last()
-                        && scope.len() > MAX_LOCALS
-                    {
-                        self.errors.push(AnalyzeError {
-                            kind: AnalyzeErrorKind::TooManyLocals {
-                                count: scope.len(),
-                                max: MAX_LOCALS,
-                            },
-                        });
+                    // struct 型はメモリに配置されるためレジスタを消費しない
+                    if let Some(scope) = self.locals.last() {
+                        let reg_count: usize = scope
+                            .values()
+                            .map(|ty| {
+                                if let Type::UserType(name) = ty
+                                    && self.structs.contains_key(name)
+                                {
+                                    return 0;
+                                }
+                                1
+                            })
+                            .sum();
+                        if reg_count > MAX_LOCALS {
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::TooManyLocals {
+                                    count: reg_count,
+                                    max: MAX_LOCALS,
+                                },
+                            });
+                        }
                     }
 
                     self.locals.pop();

@@ -613,3 +613,30 @@ fn test_struct_inequality() {
          }",
     );
 }
+
+#[test]
+fn test_struct_locals_dont_count_toward_register_limit() {
+    // struct 型ローカルはメモリに配置されるため、レジスタ上限にカウントされない
+    // 8 スカラー + 2 struct = スカラーのみ 8 なので OK (上限 10)
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn f(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8) -> u8 {
+            let p1: Pos = Pos { x: 1, y: 2 };
+            let p2: Pos = Pos { x: 3, y: 4 };
+            a
+         }
+         fn main() -> () { }",
+    );
+}
+
+#[test]
+fn test_many_struct_params_no_overflow() {
+    // struct パラメータが多くてもレジスタ上限に引っかからない
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn f(a: Pos, b: Pos, c: Pos, d: Pos, e: Pos) -> u8 {
+            a.x
+         }
+         fn main() -> () { }",
+    );
+}

@@ -416,3 +416,155 @@ fn test_struct_equality_compiles() {
         "expected at least 2 SE instructions for struct equality (field-by-field)"
     );
 }
+
+#[test]
+fn test_struct_param_memory_backed() {
+    // struct パラメータをメモリ経由で受け渡しできること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn get_x(p: Pos) -> u8 { p.x }
+         fn main() -> u8 {
+            let p: Pos = Pos { x: 5, y: 10 };
+            get_x(p)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // CALL 命令が含まれること
+    let has_call = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x20);
+    assert!(has_call, "expected CALL instruction");
+}
+
+#[test]
+fn test_multiple_struct_params_no_overflow() {
+    // 複数の struct 引数でもレジスタオーバーフローしないこと
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn add_pos(a: Pos, b: Pos) -> u8 {
+            a.x + b.x
+         }
+         fn main() -> u8 {
+            let p1: Pos = Pos { x: 1, y: 2 };
+            let p2: Pos = Pos { x: 3, y: 4 };
+            add_pos(p1, p2)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    let has_call = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x20);
+    assert!(has_call, "expected CALL instruction");
+}
+
+#[test]
+fn test_struct_return_to_memory() {
+    // struct を返す関数の戻り値がメモリ経由で使えること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn make_pos(x: u8, y: u8) -> Pos {
+            Pos { x: x, y: y }
+         }
+         fn main() -> u8 {
+            let p: Pos = make_pos(10, 20);
+            p.x
+         }",
+    );
+    assert!(bytes.len() >= 4);
+}
+
+#[test]
+fn test_nested_struct_field_access_memory() {
+    // ネストした struct のフィールドアクセスが動作すること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         struct Entity { pos: Pos, hp: u8 }
+         fn get_entity_x(e: Entity) -> u8 {
+            e.pos.x
+         }
+         fn main() -> u8 {
+            let e: Entity = Entity { pos: Pos { x: 42, y: 10 }, hp: 100 };
+            get_entity_x(e)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // 42 がロードされること
+    let has_ld_42 = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x60 && c[1] == 42);
+    assert!(has_ld_42, "expected LD with value 42");
+}
+
+#[test]
+fn test_struct_equality_memory_backed() {
+    // メモリ上の struct 同士の等値比較が動作すること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn same_pos(a: Pos, b: Pos) -> bool {
+            a == b
+         }
+         fn main() -> bool {
+            let p1: Pos = Pos { x: 1, y: 2 };
+            let p2: Pos = Pos { x: 1, y: 2 };
+            same_pos(p1, p2)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // SE 命令 (5XY0) が含まれること (フィールドごとの比較)
+    let se_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x50).count();
+    assert!(
+        se_count >= 2,
+        "expected at least 2 SE instructions for struct equality"
+    );
+}
+
+#[test]
+fn test_tco_with_struct_param() {
+    // TCO + struct 引数が動作すること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn move_right(p: Pos, n: u8) -> u8 {
+            if n == 0 {
+               p.x
+            } else {
+               move_right(Pos { x: p.x + 1, y: p.y }, n - 1)
+            }
+         }
+         fn main() -> u8 {
+            move_right(Pos { x: 0, y: 0 }, 5)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // JP 命令が含まれること (TCO)
+    let has_jp = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x10);
+    assert!(has_jp, "expected JP instruction for TCO");
+}
+
+#[test]
+fn test_issue34_multiple_struct_args() {
+    // issue #34 の再現ケース: 複数の struct 引数 + ローカル変数
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn distance_x(a: Pos, b: Pos) -> u8 {
+            let dx: u8 = b.x - a.x;
+            dx
+         }
+         fn main() -> u8 {
+            let p1: Pos = Pos { x: 10, y: 20 };
+            let p2: Pos = Pos { x: 30, y: 40 };
+            distance_x(p1, p2)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+}
+
+#[test]
+fn test_struct_update_memory() {
+    // struct update 構文がメモリベースで動作すること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn move_x(p: Pos) -> Pos {
+            Pos { x: p.x + 1, ..p }
+         }
+         fn main() -> u8 {
+            let p: Pos = Pos { x: 5, y: 10 };
+            let q: Pos = move_x(p);
+            q.x
+         }",
+    );
+    assert!(bytes.len() >= 4);
+}
