@@ -29,9 +29,21 @@ CHIP-8 ROM にコンパイルできる小さな関数型言語を Rust で実装
 ### Phase ごとの進め方
 
 1. `phase/{番号}-{短い説明}` ブランチを作成
-2. 空コミットで PR を作成し、ボディに実装計画を記載
-3. 実装を進め、テスト・lint・フォーマットが通ることを確認
+2. 実装を進め、テスト・lint・フォーマットが通ることを確認
+3. PR を作成し、ボディに変更内容・テスト計画を記載
 4. PR をマージし、次の Phase へ進む
+
+### PR マージまでのワークフロー
+
+```
+1. ブランチ作成    git checkout -b phase/{番号}-{短い説明}
+2. 実装・テスト    cargo test && cargo clippy && cargo fmt --check
+3. コミット        git add <files> && git commit
+4. プッシュ        git push -u origin <branch>
+5. PR 作成         gh pr create --title "..." --body "..."
+6. マージ          gh pr merge <number> --merge --delete-branch
+7. ローカル同期    git checkout main && git pull
+```
 
 ## コマンド
 

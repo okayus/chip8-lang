@@ -8,6 +8,7 @@ pub enum Type {
     Unit,
     Array(Box<Type>, usize),
     Sprite(usize),
+    UserEnum(String),
 }
 
 /// 二項演算子
@@ -82,6 +83,21 @@ pub enum ExprKind {
         array: Box<Expr>,
         index: Box<Expr>,
     },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+    EnumVariant {
+        enum_name: String,
+        variant: String,
+    },
+}
+
+/// match 式のアーム
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArm {
+    pub pattern: Expr,
+    pub body: Expr,
 }
 
 /// 文
@@ -121,6 +137,11 @@ pub enum TopLevel {
         name: String,
         ty: Type,
         value: Expr,
+        span: Span,
+    },
+    EnumDef {
+        name: String,
+        variants: Vec<String>,
         span: Span,
     },
 }
