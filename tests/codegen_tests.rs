@@ -2,6 +2,8 @@ use chip8_lang::codegen::CodeGen;
 use chip8_lang::lexer::Lexer;
 use chip8_lang::parser::Parser;
 
+mod chip8_interpreter;
+
 fn compile(input: &str) -> Vec<u8> {
     let mut lexer = Lexer::new(input);
     let tokens = lexer.tokenize().unwrap();
@@ -9,6 +11,12 @@ fn compile(input: &str) -> Vec<u8> {
     let program = parser.parse_program().unwrap();
     let mut codegen = CodeGen::new();
     codegen.generate(&program)
+}
+
+fn compile_and_run(input: &str) -> u8 {
+    let bytes = compile(input);
+    let mut vm = chip8_interpreter::Chip8::new(&bytes);
+    vm.run_and_get_v0().expect("program hanged (cycle limit)")
 }
 
 #[test]
@@ -653,4 +661,257 @@ fn test_array_index_assign_compiles() {
     // FX1E (AddI) が含まれること (インデックス計算)
     let has_fx1e = bytes.chunks(2).any(|c| (c[1] & 0xFF) == 0x1E);
     assert!(has_fx1e, "expected FX1E instruction for index calculation");
+}
+
+// ============================================================
+// CHIP-8 インタプリタによる実行検証テスト
+// ============================================================
+
+#[test]
+fn test_run_simple_return() {
+    assert_eq!(compile_and_run("fn main() -> u8 { 42 }"), 42);
+}
+
+#[test]
+fn test_run_flat_struct_field_access() {
+    assert_eq!(
+        compile_and_run(
+            "struct Big { a: u8, b: u8, c: u8, d: u8, e: u8 }
+             fn get_e(s: Big) -> u8 { s.e }
+             fn main() -> u8 {
+                get_e(Big { a: 1, b: 3, c: 5, d: 7, e: 9 })
+             }"
+        ),
+        9
+    );
+}
+
+#[test]
+fn test_run_flat_struct_first_field() {
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn get_x(p: Pos) -> u8 { p.x }
+             fn main() -> u8 {
+                get_x(Pos { x: 42, y: 10 })
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_speed() {
+    // Issue #42: ネスト struct のスカラーフィールド (nested struct の後ろ)
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_speed(s: GameState) -> u8 { s.speed }
+             fn main() -> u8 {
+                get_speed(GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 })
+             }"
+        ),
+        9
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_pos_x() {
+    // Issue #42: ネスト struct のフィールドアクセス
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_px(s: GameState) -> u8 { s.pos.x }
+             fn main() -> u8 {
+                get_px(GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 })
+             }"
+        ),
+        2
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_pos_y() {
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_py(s: GameState) -> u8 { s.pos.y }
+             fn main() -> u8 {
+                get_py(GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 })
+             }"
+        ),
+        3
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_score() {
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_score(s: GameState) -> u8 { s.score }
+             fn main() -> u8 {
+                get_score(GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 })
+             }"
+        ),
+        8
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_piece() {
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_piece(s: GameState) -> u8 { s.piece }
+             fn main() -> u8 {
+                get_piece(GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 })
+             }"
+        ),
+        1
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_with_let() {
+    // let バインド経由でネスト struct を渡す
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_speed(s: GameState) -> u8 { s.speed }
+             fn main() -> u8 {
+                let gs: GameState = GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 };
+                get_speed(gs)
+             }"
+        ),
+        9
+    );
+}
+
+#[test]
+fn test_run_issue42_nested_struct_let_and_local() {
+    // let バインド + 他のローカル変数がある場合
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_speed(s: GameState) -> u8 { s.speed }
+             fn main() -> u8 {
+                let x: u8 = 100;
+                let gs: GameState = GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 };
+                get_speed(gs)
+             }"
+        ),
+        9
+    );
+}
+
+#[test]
+fn test_run_issue42_multiple_nested_calls() {
+    // 複数のフィールドアクセスを別々の関数で
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn get_speed(s: GameState) -> u8 { s.speed }
+             fn get_score(s: GameState) -> u8 { s.score }
+             fn main() -> u8 {
+                let gs: GameState = GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 8, speed: 9 };
+                let sp: u8 = get_speed(gs);
+                let sc: u8 = get_score(gs);
+                sp + sc
+             }"
+        ),
+        17
+    );
+}
+
+#[test]
+fn test_run_issue42_deeply_nested() {
+    // 3 段ネスト
+    assert_eq!(
+        compile_and_run(
+            "struct Inner { val: u8 }
+             struct Mid { inner: Inner, tag: u8 }
+             struct Outer { mid: Mid, extra: u8 }
+             fn get_val(o: Outer) -> u8 { o.mid.inner.val }
+             fn get_extra(o: Outer) -> u8 { o.extra }
+             fn main() -> u8 {
+                let o: Outer = Outer { mid: Mid { inner: Inner { val: 77 }, tag: 88 }, extra: 99 };
+                get_val(o) + get_extra(o)
+             }"
+        ),
+        176 // 77 + 99
+    );
+}
+
+#[test]
+fn test_run_issue42_deeply_nested_val_only() {
+    // 3 段ネストで inner.val だけ取得
+    assert_eq!(
+        compile_and_run(
+            "struct Inner { val: u8 }
+             struct Mid { inner: Inner, tag: u8 }
+             struct Outer { mid: Mid, extra: u8 }
+             fn get_val(o: Outer) -> u8 { o.mid.inner.val }
+             fn main() -> u8 {
+                get_val(Outer { mid: Mid { inner: Inner { val: 77 }, tag: 88 }, extra: 99 })
+             }"
+        ),
+        77
+    );
+}
+
+#[test]
+fn test_run_issue42_deeply_nested_tag() {
+    assert_eq!(
+        compile_and_run(
+            "struct Inner { val: u8 }
+             struct Mid { inner: Inner, tag: u8 }
+             struct Outer { mid: Mid, extra: u8 }
+             fn get_tag(o: Outer) -> u8 { o.mid.tag }
+             fn main() -> u8 {
+                get_tag(Outer { mid: Mid { inner: Inner { val: 77 }, tag: 88 }, extra: 99 })
+             }"
+        ),
+        88
+    );
+}
+
+#[test]
+fn test_run_issue42_deeply_nested_extra() {
+    assert_eq!(
+        compile_and_run(
+            "struct Inner { val: u8 }
+             struct Mid { inner: Inner, tag: u8 }
+             struct Outer { mid: Mid, extra: u8 }
+             fn get_extra(o: Outer) -> u8 { o.extra }
+             fn main() -> u8 {
+                get_extra(Outer { mid: Mid { inner: Inner { val: 77 }, tag: 88 }, extra: 99 })
+             }"
+        ),
+        99
+    );
+}
+
+#[test]
+fn test_run_issue42_mid_struct_access() {
+    // 2 段ネスト: Mid { inner: Inner, tag } 直接
+    assert_eq!(
+        compile_and_run(
+            "struct Inner { val: u8 }
+             struct Mid { inner: Inner, tag: u8 }
+             fn get_tag(m: Mid) -> u8 { m.tag }
+             fn main() -> u8 {
+                get_tag(Mid { inner: Inner { val: 77 }, tag: 88 })
+             }"
+        ),
+        88
+    );
 }
