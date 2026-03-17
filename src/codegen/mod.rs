@@ -538,6 +538,17 @@ impl CodeGen {
         }
     }
 
+    /// メモリ間コピー (レジスタを破壊しない)
+    /// emit_load_from_memory / emit_store_to_memory の XOR swap により
+    /// V0 を含む全ライブレジスタを保護する
+    fn emit_memcpy(&mut self, src_addr: u16, dst_addr: u16, count: usize) {
+        let tmp = self.alloc_temp_register();
+        for i in 0..count {
+            self.emit_load_from_memory(tmp.into(), src_addr + i as u16);
+            self.emit_store_to_memory(tmp.into(), dst_addr + i as u16);
+        }
+    }
+
     fn pattern_value(&self, pattern: &Expr) -> u8 {
         match &pattern.kind {
             ExprKind::IntLiteral(v) => *v as u8,
@@ -1163,12 +1174,7 @@ impl CodeGen {
                 if let Some(base_expr) = base {
                     let base_loc = self.codegen_expr(base_expr);
                     if let ValueLocation::InMemory { addr: src_addr, .. } = base_loc {
-                        // メモリ → メモリ: V0..V(n-1) 経由でコピー
-                        self.emit_op(Opcode::LdI(Addr::new(src_addr)));
-                        let last = UserRegister::new(field_count as u8 - 1);
-                        self.emit_op(Opcode::LdVxI(last.into()));
-                        self.emit_op(Opcode::LdI(Addr::new(struct_addr)));
-                        self.emit_op(Opcode::LdIVx(last.into()));
+                        self.emit_memcpy(src_addr, struct_addr, field_count);
                     }
                 }
 
@@ -1187,11 +1193,7 @@ impl CodeGen {
                             let val_loc = self.codegen_expr(value_expr);
                             let sub_count = self.struct_field_count(sub_name);
                             if let ValueLocation::InMemory { addr: src_addr, .. } = val_loc {
-                                self.emit_op(Opcode::LdI(Addr::new(src_addr)));
-                                let last = UserRegister::new(sub_count as u8 - 1);
-                                self.emit_op(Opcode::LdVxI(last.into()));
-                                self.emit_op(Opcode::LdI(Addr::new(struct_addr + offset as u16)));
-                                self.emit_op(Opcode::LdIVx(last.into()));
+                                self.emit_memcpy(src_addr, struct_addr + offset as u16, sub_count);
                             }
                             continue;
                         }
@@ -1520,11 +1522,7 @@ impl CodeGen {
                             ref struct_name,
                         } => {
                             let count = self.struct_field_count(struct_name);
-                            self.emit_op(Opcode::LdI(Addr::new(src_addr)));
-                            let last = UserRegister::new(count as u8 - 1);
-                            self.emit_op(Opcode::LdVxI(last.into()));
-                            self.emit_op(Opcode::LdI(Addr::new(target_addr)));
-                            self.emit_op(Opcode::LdIVx(last.into()));
+                            self.emit_memcpy(src_addr, target_addr, count);
                         }
                         _ => {
                             if let Some(val_reg) = val_loc.register() {

@@ -988,3 +988,90 @@ fn test_run_issue44_struct_all_fields_after_pass() {
         60
     );
 }
+
+// ===== Issue #46: ネスト struct コピーがレジスタを破壊するバグ =====
+
+#[test]
+fn test_run_issue46_nested_struct_literal_preserves_registers() {
+    // ネスト struct (Pos) のコピーで V0/V1 が破壊されないこと
+    // バグだと score = 0 になる (V1 が Pos.y = 0 で上書きされる)
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn make_gs(p: u8, sc: u8, sp: u8) -> GameState {
+                GameState { piece: p, pos: Pos { x: 28, y: 0 }, score: sc, speed: sp }
+             }
+             fn main() -> u8 {
+                let gs: GameState = make_gs(1, 6, 15);
+                gs.score
+             }"
+        ),
+        6
+    );
+}
+
+#[test]
+fn test_run_issue46_on_land_pattern() {
+    // issue #46 の再現パターン: update_score 後に struct フィールドが壊れない
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn use_val(v: u8) -> u8 { v }
+             fn make_gs(p: u8, sc: u8, sp: u8) -> GameState {
+                GameState { piece: p, pos: Pos { x: 28, y: 0 }, score: sc, speed: sp }
+             }
+             fn on_land(state: GameState) -> GameState {
+                use_val(state.score);
+                let p: u8 = 7;
+                make_gs(p, state.score + 1, state.speed)
+             }
+             fn main() -> u8 {
+                let s: GameState = GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 5, speed: 15 };
+                let r: GameState = on_land(s);
+                r.score
+             }"
+        ),
+        6
+    );
+}
+
+#[test]
+fn test_run_issue46_struct_update_syntax_preserves_registers() {
+    // struct update syntax (base) でレジスタが壊れないこと
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn update(gs: GameState) -> GameState {
+                GameState { ..gs, score: gs.score + 1 }
+             }
+             fn main() -> u8 {
+                let s: GameState = GameState { piece: 1, pos: Pos { x: 2, y: 3 }, score: 10, speed: 20 };
+                let r: GameState = update(s);
+                r.score
+             }"
+        ),
+        11
+    );
+}
+
+#[test]
+fn test_run_issue46_nested_struct_piece_preserved() {
+    // ネスト struct コピー後に piece (V0) が壊れないこと
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             struct GameState { piece: u8, pos: Pos, score: u8, speed: u8 }
+             fn make_gs(p: u8, sc: u8, sp: u8) -> GameState {
+                GameState { piece: p, pos: Pos { x: 28, y: 0 }, score: sc, speed: sp }
+             }
+             fn main() -> u8 {
+                let gs: GameState = make_gs(42, 6, 15);
+                gs.piece
+             }"
+        ),
+        42
+    );
+}
