@@ -392,10 +392,7 @@ impl CodeGen {
     }
 
     fn v0_is_bound(&self) -> bool {
-        self.local_bindings.values().any(|b| match b {
-            LocalBinding::Single(r) => r.index() == 0,
-            LocalBinding::StructInMemory { .. } => false,
-        })
+        self.next_free_reg > 0
     }
 
     /// struct のフラット化フィールド数を計算

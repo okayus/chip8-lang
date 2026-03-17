@@ -915,3 +915,76 @@ fn test_run_issue42_mid_struct_access() {
         88
     );
 }
+
+// ===== Issue #44: struct フィールドアクセスで値が壊れるバグ =====
+
+#[test]
+fn test_run_issue44_struct_first_field_passed_correctly() {
+    // V0 クロバリングの回帰テスト: local_var_count=0 で struct を渡すとき
+    // field0 (V0) が後続フィールドのロードで破壊されないこと
+    assert_eq!(
+        compile_and_run(
+            "struct Big { a: u8, b: u8, c: u8, d: u8, e: u8 }
+             fn get_a(s: Big) -> u8 { s.a }
+             fn main() -> u8 {
+                get_a(Big { a: 42, b: 2, c: 3, d: 4, e: 5 })
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_run_issue44_struct_pass_no_local_vars() {
+    // local_var_count=0 で 2 フィールド struct の先頭フィールドが正しいか
+    assert_eq!(
+        compile_and_run(
+            "struct Pair { x: u8, y: u8 }
+             fn first(p: Pair) -> u8 { p.x }
+             fn main() -> u8 {
+                first(Pair { x: 7, y: 99 })
+             }"
+        ),
+        7
+    );
+}
+
+#[test]
+fn test_run_issue44_multiple_calls_with_struct_fields() {
+    // issue #44 パターン: 複数関数呼び出し + struct フィールドアクセス
+    assert_eq!(
+        compile_and_run(
+            "struct State { speed: u8, score: u8, level: u8 }
+             fn use_score(s: u8) -> u8 { s }
+             fn make_state(sp: u8, sc: u8, lv: u8) -> State {
+                State { speed: sp, score: sc, level: lv }
+             }
+             fn on_land(st: State) -> State {
+                use_score(st.score);
+                let x: u8 = 5;
+                make_state(st.speed, st.score + 1, x)
+             }
+             fn main() -> u8 {
+                let s: State = State { speed: 10, score: 20, level: 30 };
+                let s2: State = on_land(s);
+                s2.speed
+             }"
+        ),
+        10
+    );
+}
+
+#[test]
+fn test_run_issue44_struct_all_fields_after_pass() {
+    // struct 全フィールドが関数呼び出し後も正しいことを確認
+    assert_eq!(
+        compile_and_run(
+            "struct Triple { a: u8, b: u8, c: u8 }
+             fn sum_fields(t: Triple) -> u8 { t.a + t.b + t.c }
+             fn main() -> u8 {
+                sum_fields(Triple { a: 10, b: 20, c: 30 })
+             }"
+        ),
+        60
+    );
+}
