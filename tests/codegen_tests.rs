@@ -325,3 +325,43 @@ fn test_random_enum_power_of_two() {
         "expected RND with mask 0x03 for 4-variant enum"
     );
 }
+
+#[test]
+fn test_tco_self_recursion_generates_jp() {
+    // 末尾再帰は CALL ではなく JP にコンパイルされるべき
+    let bytes = compile(
+        "fn count(n: u8) -> u8 {
+            if n == 0 { 0 } else { count(n - 1) }
+         }
+         fn main() -> u8 { count(5) }",
+    );
+    // count 関数内の末尾再帰は JP (1NNN) であるべき
+    // main 関数からの count 呼び出しは CALL (2NNN) であるべき
+    // JP は最初の命令 (main へ) と count 内の TCO とループ的なものがある
+    let jp_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x10).count();
+    let call_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x20).count();
+    // CALL は main→count の1回のみ (TCO 分は JP に変換)
+    assert_eq!(call_count, 1, "expected exactly 1 CALL (main→count)");
+    // JP は: main へのジャンプ + if-else の条件ジャンプ + TCO ジャンプ (最低3つ)
+    assert!(
+        jp_count >= 3,
+        "expected at least 3 JP instructions (main + if-else + TCO)"
+    );
+}
+
+#[test]
+fn test_non_tail_recursion_generates_call() {
+    // 非末尾位置の再帰は通常の CALL のまま
+    let bytes = compile(
+        "fn add_one(n: u8) -> u8 {
+            if n == 0 { 0 } else { add_one(n - 1) + 1 }
+         }
+         fn main() -> u8 { add_one(3) }",
+    );
+    // add_one(n-1) + 1 は末尾位置ではない → CALL が2つ (main→add_one, add_one→add_one)
+    let call_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x20).count();
+    assert_eq!(
+        call_count, 2,
+        "expected 2 CALL instructions (non-tail recursion)"
+    );
+}
