@@ -73,6 +73,12 @@ pub struct CodeGen {
     forward_refs: Vec<ForwardRef>,
     /// ループごとの break 先パッチオフセットのスタック
     loop_break_offsets: Vec<Vec<ByteOffset>>,
+    /// 現在コード生成中の関数名 (TCO 検出用)
+    current_fn_name: Option<String>,
+    /// 現在の関数の先頭アドレス (TCO ジャンプ先)
+    current_fn_start_addr: Option<Addr>,
+    /// 現在の関数のパラメータ数 (TCO 引数コピー用)
+    current_fn_param_count: u8,
 }
 
 impl CodeGen {
@@ -91,6 +97,9 @@ impl CodeGen {
             local_var_count: 0,
             forward_refs: Vec::new(),
             loop_break_offsets: Vec::new(),
+            current_fn_name: None,
+            current_fn_start_addr: None,
+            current_fn_param_count: 0,
         }
     }
 
@@ -157,13 +166,21 @@ impl CodeGen {
                 }
                 self.local_var_count = self.next_free_reg;
 
-                let result = self.codegen_expr(body);
+                // TCO 用に現在の関数情報を記録
+                self.current_fn_name = Some(name.clone());
+                self.current_fn_start_addr = Some(addr);
+                self.current_fn_param_count = params.len() as u8;
+
+                let result = self.codegen_expr_tail(body);
                 if let Some(reg) = result.register()
                     && reg != Register::V0
                 {
                     self.emit_op(Opcode::LdReg(Register::V0, reg));
                 }
                 self.emit_op(Opcode::Ret);
+
+                self.current_fn_name = None;
+                self.current_fn_start_addr = None;
             }
         }
 
@@ -292,6 +309,86 @@ impl CodeGen {
     }
 
     // ---- コード生成 ----
+
+    /// 末尾位置の式をコード生成 (TCO 対象の自己再帰を検出)
+    fn codegen_expr_tail(&mut self, expr: &Expr) -> ValueLocation {
+        match &expr.kind {
+            // 末尾位置での自己再帰呼び出し → TCO
+            ExprKind::Call { name, args } if self.current_fn_name.as_deref() == Some(name) => {
+                let fn_start = self.current_fn_start_addr.unwrap();
+                let param_count = self.current_fn_param_count;
+
+                // 全引数を temp レジスタに評価
+                let mut arg_regs = Vec::new();
+                for arg in args {
+                    if let Some(reg) = self.codegen_expr(arg).register() {
+                        arg_regs.push(reg);
+                    }
+                }
+
+                // temp → V0, V1, ... にコピー (パラメータ上書き)
+                for i in 0..param_count {
+                    let target: Register = UserRegister::new(i).into();
+                    if i < arg_regs.len() as u8 && arg_regs[i as usize] != target {
+                        self.emit_op(Opcode::LdReg(target, arg_regs[i as usize]));
+                    }
+                }
+
+                // 関数先頭にジャンプ (CALL + RET の代わり)
+                self.emit_op(Opcode::Jp(fn_start));
+                ValueLocation::Void
+            }
+            // if-else: 両ブランチを末尾位置として再帰
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let Some(cond_reg) = self.codegen_expr(cond).register() else {
+                    return ValueLocation::Void;
+                };
+                self.emit_op(Opcode::SneImm(cond_reg, 0x00));
+                let jp_else_offset = self.emit_placeholder();
+
+                let then_loc = self.codegen_expr_tail(then_block);
+
+                if let Some(else_block) = else_block {
+                    let jp_end_offset = self.emit_placeholder();
+
+                    let else_addr = self.current_addr();
+                    self.patch_at(jp_else_offset, Opcode::Jp(else_addr));
+
+                    let else_loc = self.codegen_expr_tail(else_block);
+
+                    let end_addr = self.current_addr();
+                    self.patch_at(jp_end_offset, Opcode::Jp(end_addr));
+
+                    match (then_loc, else_loc) {
+                        (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
+                        (ValueLocation::InRegister(r), _) => ValueLocation::InRegister(r),
+                        _ => ValueLocation::Void,
+                    }
+                } else {
+                    let end_addr = self.current_addr();
+                    self.patch_at(jp_else_offset, Opcode::Jp(end_addr));
+                    then_loc
+                }
+            }
+            // block: 末尾式を末尾位置として再帰
+            ExprKind::Block { stmts, expr } => {
+                for stmt in stmts {
+                    self.codegen_stmt(stmt);
+                }
+                if let Some(tail) = expr {
+                    self.codegen_expr_tail(tail)
+                } else {
+                    ValueLocation::Void
+                }
+            }
+            // その他: 通常のコード生成にフォールバック
+            _ => self.codegen_expr(expr),
+        }
+    }
 
     fn codegen_expr(&mut self, expr: &Expr) -> ValueLocation {
         match &expr.kind {
