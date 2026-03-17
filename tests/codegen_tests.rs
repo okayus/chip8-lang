@@ -365,3 +365,22 @@ fn test_non_tail_recursion_generates_call() {
         "expected 2 CALL instructions (non-tail recursion)"
     );
 }
+
+#[test]
+fn test_struct_literal_and_field_access() {
+    // struct リテラルとフィールドアクセスがコンパイルできること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> u8 {
+            let p: Pos = Pos { x: 10, y: 20 };
+            p.x
+         }",
+    );
+    // コンパイルが成功し、適切なバイトコードが生成されること
+    assert!(bytes.len() >= 4);
+    // LD 命令 (6XKK) が含まれること (10 と 20 のロード)
+    let has_ld_10 = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x60 && c[1] == 10);
+    let has_ld_20 = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x60 && c[1] == 20);
+    assert!(has_ld_10, "expected LD with value 10");
+    assert!(has_ld_20, "expected LD with value 20");
+}

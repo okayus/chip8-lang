@@ -504,3 +504,77 @@ fn test_random_enum_wrong_arg_count() {
         },
     );
 }
+
+#[test]
+fn test_struct_basic() {
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> Pos { Pos { x: 1, y: 2 } }",
+    );
+}
+
+#[test]
+fn test_struct_field_access() {
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> u8 {
+            let p: Pos = Pos { x: 10, y: 20 };
+            p.x
+         }",
+    );
+}
+
+#[test]
+fn test_struct_undefined_field() {
+    analyze_err_kind(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> Pos { Pos { x: 1, z: 2 } }",
+        AnalyzeErrorKind::UndefinedField {
+            struct_name: "Pos".to_string(),
+            field: "z".to_string(),
+        },
+    );
+}
+
+#[test]
+fn test_struct_missing_fields() {
+    analyze_err_matches(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> Pos { Pos { x: 1 } }",
+        |k| matches!(k, AnalyzeErrorKind::MissingFields { .. }),
+    );
+}
+
+#[test]
+fn test_struct_field_access_on_non_struct() {
+    analyze_err_matches(
+        "fn main() -> u8 {
+            let x: u8 = 1;
+            x.field
+         }",
+        |k| matches!(k, AnalyzeErrorKind::FieldAccessOnNonStruct(_)),
+    );
+}
+
+#[test]
+fn test_struct_update_syntax() {
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> Pos {
+            let p: Pos = Pos { x: 1, y: 2 };
+            Pos { ..p, x: 10 }
+         }",
+    );
+}
+
+#[test]
+fn test_struct_as_param_and_return() {
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn get_x(p: Pos) -> u8 { p.x }
+         fn main() -> u8 {
+            let p: Pos = Pos { x: 5, y: 10 };
+            get_x(p)
+         }",
+    );
+}

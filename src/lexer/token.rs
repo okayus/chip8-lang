@@ -20,6 +20,7 @@ pub enum TokenKind {
     False,
     Match,
     Enum,
+    Struct,
 
     // リテラル
     IntLiteral(u64),
@@ -58,6 +59,8 @@ pub enum TokenKind {
     FatArrow,   // =>
     ColonColon, // ::
     Pipe,       // |>
+    Dot,        // .
+    DotDot,     // ..
 
     // 特殊
     Eof,

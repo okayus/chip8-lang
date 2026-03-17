@@ -93,6 +93,19 @@ pub enum AnalyzeErrorKind {
     UnknownType(String),
     /// random_enum の引数が enum 名でない
     RandomEnumArgNotEnum(String),
+    /// 未定義の struct
+    UndefinedStruct(String),
+    /// 未定義のフィールド
+    UndefinedField { struct_name: String, field: String },
+    /// struct リテラルで必須フィールドが不足
+    MissingFields {
+        struct_name: String,
+        missing: Vec<String>,
+    },
+    /// struct リテラルでフィールドが重複
+    DuplicateField { struct_name: String, field: String },
+    /// フィールドアクセスの対象が struct でない
+    FieldAccessOnNonStruct(Type),
 }
 
 /// 意味解析エラー
@@ -206,6 +219,26 @@ impl std::fmt::Display for AnalyzeError {
             AnalyzeErrorKind::RandomEnumArgNotEnum(name) => {
                 write!(f, "random_enum argument must be an enum name, got '{name}'")
             }
+            AnalyzeErrorKind::UndefinedStruct(name) => {
+                write!(f, "undefined struct: '{name}'")
+            }
+            AnalyzeErrorKind::UndefinedField { struct_name, field } => {
+                write!(f, "undefined field '{field}' in struct '{struct_name}'")
+            }
+            AnalyzeErrorKind::MissingFields {
+                struct_name,
+                missing,
+            } => write!(
+                f,
+                "missing fields in struct '{struct_name}': {}",
+                missing.join(", ")
+            ),
+            AnalyzeErrorKind::DuplicateField { struct_name, field } => {
+                write!(f, "duplicate field '{field}' in struct '{struct_name}'")
+            }
+            AnalyzeErrorKind::FieldAccessOnNonStruct(ty) => {
+                write!(f, "field access on non-struct type: {ty:?}")
+            }
         }
     }
 }
@@ -225,6 +258,8 @@ pub struct Analyzer {
     functions: HashMap<String, FnSig>,
     /// ユーザー定義 enum (名前 → variant リスト)
     enums: HashMap<String, Vec<String>>,
+    /// ユーザー定義 struct (名前 → フィールド定義リスト)
+    structs: HashMap<String, Vec<StructField>>,
     /// ローカルスコープスタック
     locals: Vec<HashMap<String, Type>>,
     /// 現在の関数の戻り値型
@@ -241,6 +276,7 @@ impl Analyzer {
             globals: HashMap::new(),
             functions: HashMap::new(),
             enums: HashMap::new(),
+            structs: HashMap::new(),
             locals: Vec::new(),
             current_return_type: None,
             loop_depth: 0,
@@ -272,6 +308,9 @@ impl Analyzer {
                 TopLevel::EnumDef { name, variants, .. } => {
                     self.enums.insert(name.clone(), variants.clone());
                 }
+                TopLevel::StructDef { name, fields, .. } => {
+                    self.structs.insert(name.clone(), fields.clone());
+                }
             }
         }
 
@@ -282,7 +321,7 @@ impl Analyzer {
             });
         }
 
-        // UserEnum 型の存在チェック
+        // UserType 型の存在チェック (enum または struct)
         for top in &program.top_levels {
             let types_to_check: Vec<&Type> = match top {
                 TopLevel::FnDef {
@@ -295,11 +334,12 @@ impl Analyzer {
                     ts
                 }
                 TopLevel::LetDef { ty, .. } => vec![ty],
-                TopLevel::EnumDef { .. } => vec![],
+                TopLevel::EnumDef { .. } | TopLevel::StructDef { .. } => vec![],
             };
             for ty in types_to_check {
-                if let Type::UserEnum(name) = ty
+                if let Type::UserType(name) = ty
                     && !self.enums.contains_key(name)
+                    && !self.structs.contains_key(name)
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UnknownType(name.clone()),
@@ -365,7 +405,7 @@ impl Analyzer {
                     self.locals.pop();
                     self.current_return_type = None;
                 }
-                TopLevel::EnumDef { .. } => {}
+                TopLevel::EnumDef { .. } | TopLevel::StructDef { .. } => {}
             }
         }
 
@@ -401,7 +441,7 @@ impl Analyzer {
             }
             (Type::Sprite(_), Type::Sprite(_)) => true,
             (Type::Sprite(n), Type::Array(elem, m)) => *n == *m && **elem == Type::U8,
-            (Type::UserEnum(a), Type::UserEnum(b)) => a == b,
+            (Type::UserType(a), Type::UserType(b)) => a == b, // enum or struct, same name
             _ => false,
         }
     }
@@ -494,7 +534,7 @@ impl Analyzer {
                     }
                     if let ExprKind::Ident(name) = &args[0].kind {
                         if self.enums.contains_key(name) {
-                            return Some(Type::UserEnum(name.clone()));
+                            return Some(Type::UserType(name.clone()));
                         } else {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::RandomEnumArgNotEnum(name.clone()),
@@ -641,7 +681,7 @@ impl Analyzer {
                 let scr_ty = self.type_check_expr(scrutinee);
                 if let Some(ref st) = scr_ty
                     && *st != Type::U8
-                    && !matches!(st, Type::UserEnum(_))
+                    && !matches!(st, Type::UserType(_))
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::MatchScrutineeType(st.clone()),
@@ -666,7 +706,7 @@ impl Analyzer {
                     }
                 }
                 // enum 網羅性チェック
-                if let Some(Type::UserEnum(ref enum_name)) = scr_ty
+                if let Some(Type::UserType(ref enum_name)) = scr_ty
                     && let Some(all_variants) = self.enums.get(enum_name).cloned()
                 {
                     let covered: Vec<String> = arms
@@ -708,6 +748,111 @@ impl Analyzer {
                 }
                 Some(first_ty)
             }
+            ExprKind::StructLiteral { name, fields, base } => {
+                if let Some(struct_fields) = self.structs.get(name).cloned() {
+                    // base がある場合、struct 型であることを確認
+                    if let Some(base_expr) = base
+                        && let Some(base_ty) = self.type_check_expr(base_expr)
+                        && base_ty != Type::UserType(name.clone())
+                    {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::TypeMismatch {
+                                context: "struct update base type mismatch",
+                                expected: Type::UserType(name.clone()),
+                                found: base_ty,
+                            },
+                        });
+                    }
+                    // 重複フィールドチェック
+                    let mut seen = Vec::new();
+                    for (field_name, value) in fields {
+                        if seen.contains(field_name) {
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::DuplicateField {
+                                    struct_name: name.clone(),
+                                    field: field_name.clone(),
+                                },
+                            });
+                        }
+                        seen.push(field_name.clone());
+                        // フィールド名の存在チェックと型チェック
+                        if let Some(sf) = struct_fields.iter().find(|f| &f.name == field_name) {
+                            if let Some(val_ty) = self.type_check_expr(value)
+                                && !Self::types_compatible(&sf.ty, &val_ty)
+                            {
+                                self.errors.push(AnalyzeError {
+                                    kind: AnalyzeErrorKind::TypeMismatch {
+                                        context: "struct field type mismatch",
+                                        expected: sf.ty.clone(),
+                                        found: val_ty,
+                                    },
+                                });
+                            }
+                        } else {
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::UndefinedField {
+                                    struct_name: name.clone(),
+                                    field: field_name.clone(),
+                                },
+                            });
+                        }
+                    }
+                    // base なしの場合、全フィールドが指定されているかチェック
+                    if base.is_none() {
+                        let missing: Vec<String> = struct_fields
+                            .iter()
+                            .filter(|f| !seen.contains(&f.name))
+                            .map(|f| f.name.clone())
+                            .collect();
+                        if !missing.is_empty() {
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::MissingFields {
+                                    struct_name: name.clone(),
+                                    missing,
+                                },
+                            });
+                        }
+                    }
+                    Some(Type::UserType(name.clone()))
+                } else {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::UndefinedStruct(name.clone()),
+                    });
+                    None
+                }
+            }
+            ExprKind::FieldAccess { expr: inner, field } => {
+                if let Some(ty) = self.type_check_expr(inner) {
+                    if let Type::UserType(struct_name) = &ty {
+                        if let Some(struct_fields) = self.structs.get(struct_name).cloned() {
+                            if let Some(sf) = struct_fields.iter().find(|f| &f.name == field) {
+                                Some(sf.ty.clone())
+                            } else {
+                                self.errors.push(AnalyzeError {
+                                    kind: AnalyzeErrorKind::UndefinedField {
+                                        struct_name: struct_name.clone(),
+                                        field: field.clone(),
+                                    },
+                                });
+                                None
+                            }
+                        } else {
+                            // UserType だが struct ではない (enum)
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::FieldAccessOnNonStruct(ty),
+                            });
+                            None
+                        }
+                    } else {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::FieldAccessOnNonStruct(ty),
+                        });
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
             ExprKind::EnumVariant { enum_name, variant } => {
                 if let Some(variants) = self.enums.get(enum_name) {
                     if !variants.contains(variant) {
@@ -719,7 +864,7 @@ impl Analyzer {
                         });
                         None
                     } else {
-                        Some(Type::UserEnum(enum_name.clone()))
+                        Some(Type::UserType(enum_name.clone()))
                     }
                 } else {
                     self.errors.push(AnalyzeError {
@@ -759,11 +904,12 @@ impl Analyzer {
     fn type_check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
-                if let Type::UserEnum(enum_name) = ty
-                    && !self.enums.contains_key(enum_name)
+                if let Type::UserType(type_name) = ty
+                    && !self.enums.contains_key(type_name)
+                    && !self.structs.contains_key(type_name)
                 {
                     self.errors.push(AnalyzeError {
-                        kind: AnalyzeErrorKind::UnknownType(enum_name.clone()),
+                        kind: AnalyzeErrorKind::UnknownType(type_name.clone()),
                     });
                 }
                 if let Some(vt) = self.type_check_expr(value)
