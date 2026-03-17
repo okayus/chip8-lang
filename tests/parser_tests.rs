@@ -528,3 +528,30 @@ fn test_pipe_chain() {
         _ => panic!("expected FnDef"),
     }
 }
+
+#[test]
+fn test_random_enum_parses_as_builtin_call() {
+    let prog = parse(
+        "enum Piece { I, O, T, S, Z, L, J }
+         fn main() -> Piece { random_enum(Piece) }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                assert!(matches!(
+                    &tail.kind,
+                    ExprKind::BuiltinCall {
+                        builtin: BuiltinFunction::RandomEnum,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("expected Block with tail expr");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}

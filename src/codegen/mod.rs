@@ -699,6 +699,60 @@ impl CodeGen {
                 }
                 ValueLocation::InRegister(Register::V0)
             }
+            BuiltinFunction::RandomEnum => {
+                // args[0] は Ident(enum_name)
+                let enum_name = if let ExprKind::Ident(name) = &args[0].kind {
+                    name.clone()
+                } else {
+                    return ValueLocation::Void;
+                };
+
+                // バリアント数を取得
+                let count = self
+                    .enum_variant_values
+                    .keys()
+                    .filter(|(e, _)| *e == enum_name)
+                    .count() as u8;
+
+                let res = self.alloc_temp_register();
+
+                if count == 0 {
+                    self.emit_op(Opcode::LdImm(res.into(), 0));
+                    return ValueLocation::InRegister(res.into());
+                }
+
+                // mask = next_power_of_two(count) - 1
+                let mask = count.next_power_of_two() - 1;
+
+                if count.is_power_of_two() {
+                    // count が 2 の冪: RND で直接生成
+                    self.emit_op(Opcode::Rnd(res.into(), mask));
+                } else {
+                    // 拒否サンプリング: mask で生成し、count 以上なら再試行
+                    let tmp = self.alloc_temp_register();
+                    let loop_addr = self.current_addr();
+                    self.emit_op(Opcode::Rnd(res.into(), mask));
+                    // tmp = res をコピーし、tmp -= count で比較
+                    self.emit_op(Opcode::LdImm(tmp.into(), count));
+                    // res >= count かチェック: SUB は Vx = Vx - Vy, VF = NOT borrow
+                    // res が tmp (=count) にコピーされている代わりに、
+                    // SeImm で直接比較: res == count なら再試行
+                    // ただし SE/SNE は即値比較のみ。count 以上の判定は SUB が必要。
+                    // SUBN: tmp = count - res, VF=1 なら count >= res (つまり res <= count)
+                    // VF=0 なら count < res (res > count) → 再試行
+                    // res == count の場合も再試行が必要
+                    // → Sub: tmp(=count) - res → tmp = count - res
+                    //   VF=1: count >= res → res <= count
+                    //   res < count: OK, res == count: NG, res > count: NG
+                    // SUBN(tmp, res) → tmp = res - tmp = res - count, VF = 1 if res >= count
+                    self.emit_op(Opcode::Subn(tmp.into(), res.into()));
+                    // VF == 1 → res >= count → 再試行
+                    self.emit_op(Opcode::SneImm(Register::VF, 1));
+                    self.emit_op(Opcode::Jp(loop_addr));
+                }
+
+                ValueLocation::InRegister(res.into())
+            }
         }
     }
 
