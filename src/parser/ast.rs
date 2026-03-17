@@ -118,8 +118,20 @@ pub struct Stmt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StmtKind {
-    Let { name: String, ty: Type, value: Expr },
-    Assign { name: String, value: Expr },
+    Let {
+        name: String,
+        ty: Type,
+        value: Expr,
+    },
+    Assign {
+        name: String,
+        value: Expr,
+    },
+    IndexAssign {
+        array: String,
+        index: Expr,
+        value: Expr,
+    },
     Expr(Expr),
     Return(Option<Expr>),
     Break,
@@ -153,6 +165,7 @@ pub enum TopLevel {
         name: String,
         ty: Type,
         value: Expr,
+        mutable: bool,
         span: Span,
     },
     EnumDef {

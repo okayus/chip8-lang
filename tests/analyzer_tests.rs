@@ -640,3 +640,45 @@ fn test_many_struct_params_no_overflow() {
          fn main() -> () { }",
     );
 }
+
+#[test]
+fn test_mutable_global_ok() {
+    analyze_ok(
+        "let mut score: u8 = 0;
+         fn main() -> () {
+            score = 10;
+         }",
+    );
+}
+
+#[test]
+fn test_immutable_global_assign_error() {
+    analyze_err_matches(
+        "let score: u8 = 0;
+         fn main() -> () {
+            score = 10;
+         }",
+        |k| matches!(k, AnalyzeErrorKind::ImmutableAssignment(_)),
+    );
+}
+
+#[test]
+fn test_array_index_assign_ok() {
+    analyze_ok(
+        "let mut board: [u8; 4] = [0, 0, 0, 0];
+         fn main() -> () {
+            board[2] = 42;
+         }",
+    );
+}
+
+#[test]
+fn test_immutable_array_assign_error() {
+    analyze_err_matches(
+        "let board: [u8; 4] = [0, 0, 0, 0];
+         fn main() -> () {
+            board[2] = 42;
+         }",
+        |k| matches!(k, AnalyzeErrorKind::ImmutableAssignment(_)),
+    );
+}

@@ -276,6 +276,7 @@ impl Lexer {
             "match" => TokenKind::Match,
             "enum" => TokenKind::Enum,
             "struct" => TokenKind::Struct,
+            "mut" => TokenKind::Mut,
             _ => TokenKind::Ident(s),
         };
 

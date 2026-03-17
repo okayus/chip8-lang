@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::parser::ast::*;
 
@@ -106,6 +106,8 @@ pub enum AnalyzeErrorKind {
     DuplicateField { struct_name: String, field: String },
     /// フィールドアクセスの対象が struct でない
     FieldAccessOnNonStruct(Type),
+    /// イミュータブル変数への代入
+    ImmutableAssignment(String),
 }
 
 /// 意味解析エラー
@@ -239,6 +241,9 @@ impl std::fmt::Display for AnalyzeError {
             AnalyzeErrorKind::FieldAccessOnNonStruct(ty) => {
                 write!(f, "field access on non-struct type: {ty:?}")
             }
+            AnalyzeErrorKind::ImmutableAssignment(name) => {
+                write!(f, "cannot assign to immutable variable '{name}'")
+            }
         }
     }
 }
@@ -254,6 +259,8 @@ struct FnSig {
 pub struct Analyzer {
     /// グローバル変数の型
     globals: HashMap<String, Type>,
+    /// ミュータブルなグローバル変数の名前
+    mutable_globals: HashSet<String>,
     /// ユーザー定義関数のシグネチャ
     functions: HashMap<String, FnSig>,
     /// ユーザー定義 enum (名前 → variant リスト)
@@ -274,6 +281,7 @@ impl Analyzer {
     pub fn new() -> Self {
         Self {
             globals: HashMap::new(),
+            mutable_globals: HashSet::new(),
             functions: HashMap::new(),
             enums: HashMap::new(),
             structs: HashMap::new(),
@@ -288,8 +296,13 @@ impl Analyzer {
         // Pass 1: 全トップレベル定義を登録
         for top in &program.top_levels {
             match top {
-                TopLevel::LetDef { name, ty, .. } => {
+                TopLevel::LetDef {
+                    name, ty, mutable, ..
+                } => {
                     self.globals.insert(name.clone(), ty.clone());
+                    if *mutable {
+                        self.mutable_globals.insert(name.clone());
+                    }
                 }
                 TopLevel::FnDef {
                     name,
@@ -940,6 +953,14 @@ impl Analyzer {
             StmtKind::Assign { name, value } => {
                 let var_ty = self.lookup_var(name);
                 let val_ty = self.type_check_expr(value);
+                // グローバル変数への代入は mutable でなければエラー
+                let is_global = self.globals.contains_key(name)
+                    && !self.locals.iter().any(|s| s.contains_key(name));
+                if is_global && !self.mutable_globals.contains(name) {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::ImmutableAssignment(name.clone()),
+                    });
+                }
                 match (var_ty, val_ty) {
                     (None, _) => {
                         self.errors.push(AnalyzeError {
@@ -957,6 +978,43 @@ impl Analyzer {
                         }
                     }
                     _ => {}
+                }
+            }
+            StmtKind::IndexAssign {
+                array,
+                index,
+                value,
+            } => {
+                let arr_ty = self.lookup_var(array);
+                // 配列型チェック
+                if let Some(ref ty) = arr_ty {
+                    if !matches!(ty, Type::Array { .. }) {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::CannotIndex(ty.clone()),
+                        });
+                    }
+                } else {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::UndefinedVariable(array.clone()),
+                    });
+                }
+                // インデックスは u8
+                if let Some(idx_ty) = self.type_check_expr(index)
+                    && idx_ty != Type::U8
+                {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::ArrayIndexNotU8(idx_ty),
+                    });
+                }
+                // 値の型チェック
+                self.type_check_expr(value);
+                // mutable チェック
+                let is_global = self.globals.contains_key(array)
+                    && !self.locals.iter().any(|s| s.contains_key(array));
+                if is_global && !self.mutable_globals.contains(array) {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::ImmutableAssignment(array.clone()),
+                    });
                 }
             }
             StmtKind::Expr(expr) => {
