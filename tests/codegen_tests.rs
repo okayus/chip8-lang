@@ -274,3 +274,24 @@ fn test_pipe_compiles() {
         "expected CALL instruction"
     );
 }
+
+#[test]
+fn test_function_body_result_copied_to_v0() {
+    // draw() は VF を返す。関数本体の結果が VF の場合、RET 前に LD V0, VF が必要
+    let bytes = compile(
+        "let sprite: sprite(1) = [0b11110000];
+         fn check(x: u8, y: u8) -> bool {
+            draw(sprite, x, y)
+         }
+         fn main() -> () {
+            let c: bool = check(0, 0);
+         }",
+    );
+    // check 関数内に LD V0, VF (8F0x パターンではなく 80F0) が含まれるはず
+    // 8XY0 = LD Vx, Vy → 80F0 = LD V0, VF
+    let has_ld_v0_vf = bytes.chunks(2).any(|c| c[0] == 0x80 && c[1] == 0xF0);
+    assert!(
+        has_ld_v0_vf,
+        "expected LD V0, VF before RET in function returning draw result"
+    );
+}
