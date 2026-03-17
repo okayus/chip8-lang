@@ -940,9 +940,11 @@ impl CodeGen {
                         }
                     }
                 }
-                let num_to_save = self.local_var_count;
+                // caller-save: 全ライブレジスタをメモリに退避
+                // local_var_count ではなく next_free_reg を使い、
+                // 一時レジスタ (前の関数呼び出しの戻り値等) も保護する
+                let num_to_save = self.next_free_reg;
 
-                // caller-save: ローカル変数をメモリに退避
                 let save_addr = self.next_save_slot;
                 if num_to_save > 0 {
                     self.emit_op(Opcode::LdI(Addr::new(save_addr)));
@@ -1002,19 +1004,21 @@ impl CodeGen {
                         struct_name: ret_struct_name,
                     }
                 } else {
-                    // スカラー戻り値: 従来通り
-                    let result_reg = if num_to_save > 0 {
-                        let temp = UserRegister::new(num_to_save);
-                        self.emit_op(Opcode::LdReg(temp.into(), Register::V0));
+                    // スカラー戻り値: 新しい一時レジスタに退避して
+                    // 後続の式評価で V0 が上書きされても安全にする
+                    let result_temp = self.alloc_temp_register();
+                    if Register::from(result_temp) != Register::V0 {
+                        self.emit_op(Opcode::LdReg(result_temp.into(), Register::V0));
+                    }
+
+                    // caller-save 復帰
+                    if num_to_save > 0 {
                         self.emit_op(Opcode::LdI(Addr::new(save_addr)));
                         let last_reg = UserRegister::new(num_to_save - 1);
                         self.emit_op(Opcode::LdVxI(last_reg.into()));
-                        temp.into()
-                    } else {
-                        Register::V0
-                    };
+                    }
 
-                    ValueLocation::InRegister(result_reg)
+                    ValueLocation::InRegister(result_temp.into())
                 }
             }
             ExprKind::If {
