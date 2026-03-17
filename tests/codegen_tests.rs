@@ -384,3 +384,35 @@ fn test_struct_literal_and_field_access() {
     assert!(has_ld_10, "expected LD with value 10");
     assert!(has_ld_20, "expected LD with value 20");
 }
+
+#[test]
+fn test_enum_equality_compiles() {
+    let bytes = compile(
+        "enum Dir { Up, Down }
+         fn main() -> bool {
+            let d: Dir = Dir::Up;
+            d == Dir::Down
+         }",
+    );
+    // SE (5XY0) 命令が含まれること (等値比較)
+    let has_se = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x50);
+    assert!(has_se, "expected SE instruction for enum equality");
+}
+
+#[test]
+fn test_struct_equality_compiles() {
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> bool {
+            let a: Pos = Pos { x: 1, y: 2 };
+            let b: Pos = Pos { x: 1, y: 2 };
+            a == b
+         }",
+    );
+    // SE (5XY0) が2つ以上含まれること (フィールドごとの比較)
+    let se_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x50).count();
+    assert!(
+        se_count >= 2,
+        "expected at least 2 SE instructions for struct equality (field-by-field)"
+    );
+}

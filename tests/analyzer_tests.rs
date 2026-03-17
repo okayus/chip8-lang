@@ -578,3 +578,38 @@ fn test_struct_as_param_and_return() {
          }",
     );
 }
+
+#[test]
+fn test_enum_equality() {
+    analyze_ok(
+        "enum Dir { Up, Down }
+         fn main() -> bool {
+            let d: Dir = Dir::Up;
+            d == Dir::Up
+         }",
+    );
+}
+
+#[test]
+fn test_struct_equality() {
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> bool {
+            let a: Pos = Pos { x: 1, y: 2 };
+            let b: Pos = Pos { x: 1, y: 2 };
+            a == b
+         }",
+    );
+}
+
+#[test]
+fn test_struct_inequality() {
+    analyze_ok(
+        "struct Pos { x: u8, y: u8 }
+         fn main() -> bool {
+            let a: Pos = Pos { x: 1, y: 2 };
+            let b: Pos = Pos { x: 3, y: 2 };
+            a != b
+         }",
+    );
+}
