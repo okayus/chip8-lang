@@ -1494,6 +1494,7 @@ impl CodeGen {
                             struct_name: type_name.clone(),
                         },
                     );
+                    self.next_free_reg = self.local_var_count;
                     return;
                 }
                 // スカラー型の let

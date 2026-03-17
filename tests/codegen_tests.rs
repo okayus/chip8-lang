@@ -543,6 +543,30 @@ fn test_tco_with_struct_param() {
 }
 
 #[test]
+fn test_tco_after_struct_let_does_not_leak_temps() {
+    let bytes = compile(
+        "struct GameState { a: u8, b: u8, c: u8, d: u8, e: u8, f: u8 }
+         fn next_state(state: GameState) -> GameState {
+             state
+         }
+         fn loop_state(state: GameState, n: u8) -> u8 {
+             if n == 0 {
+                state.a
+             } else {
+                let next: GameState = next_state(state);
+                loop_state(next, n - 1)
+             }
+         }
+         fn main() -> u8 {
+             loop_state(GameState { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6 }, 3)
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    let has_jp = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x10);
+    assert!(has_jp, "expected JP instruction for TCO after struct let");
+}
+
+#[test]
 fn test_issue34_multiple_struct_args() {
     // issue #34 の再現ケース: 複数の struct 引数 + ローカル変数
     let bytes = compile(
