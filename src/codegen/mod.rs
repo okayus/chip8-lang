@@ -1143,7 +1143,7 @@ impl CodeGen {
                         return loc;
                     }
                     let pattern_val = self.pattern_value(&arm.pattern);
-                    self.emit_op(Opcode::SneImm(scr_reg, pattern_val));
+                    self.emit_op(Opcode::SeImm(scr_reg, pattern_val));
                     let jp_next_arm = self.emit_placeholder();
                     self.codegen_expr(&arm.body);
                     let jp_end = self.emit_placeholder();
