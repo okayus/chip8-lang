@@ -157,7 +157,12 @@ impl CodeGen {
                 }
                 self.local_var_count = self.next_free_reg;
 
-                self.codegen_expr(body);
+                let result = self.codegen_expr(body);
+                if let Some(reg) = result.register()
+                    && reg != Register::V0
+                {
+                    self.emit_op(Opcode::LdReg(Register::V0, reg));
+                }
                 self.emit_op(Opcode::Ret);
             }
         }
