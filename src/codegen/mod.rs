@@ -11,8 +11,8 @@ const INSTRUCTION_SIZE: u16 = 2;
 enum ValueLocation {
     /// 値はレジスタに格納されている
     InRegister(Register),
-    /// struct の値: 連続レジスタに格納
-    InRegisters(Vec<Register>),
+    /// struct の値: メモリに格納 (アドレスと struct 名)
+    InMemory { addr: u16, struct_name: String },
     /// 値を生成しない式 (loop, 配列リテラルなど)
     Void,
 }
@@ -21,7 +21,7 @@ impl ValueLocation {
     fn register(&self) -> Option<Register> {
         match self {
             ValueLocation::InRegister(r) => Some(*r),
-            ValueLocation::InRegisters(regs) => regs.first().copied(),
+            ValueLocation::InMemory { .. } => None,
             ValueLocation::Void => None,
         }
     }
@@ -50,11 +50,8 @@ enum ForwardRefKind {
 enum LocalBinding {
     /// スカラー値 (u8, bool, enum)
     Single(UserRegister),
-    /// struct 値: base レジスタと struct 名
-    Struct {
-        base_reg: UserRegister,
-        struct_name: String,
-    },
+    /// struct 値: メモリに格納 (アドレスと struct 名)
+    StructInMemory { addr: u16, struct_name: String },
 }
 
 /// コード生成器
@@ -78,7 +75,9 @@ pub struct CodeGen {
     enum_variant_values: HashMap<(String, String), u8>,
     /// struct 定義 (名前 → フィールド定義リスト)
     struct_defs: HashMap<String, Vec<StructField>>,
-    /// レジスタ退避用の次のスロットアドレス
+    /// 関数の戻り値型 (struct 戻り値のメモリ化に使用)
+    fn_return_types: HashMap<String, Type>,
+    /// メモリスロット割り当て用の次のアドレス (struct データ + caller-save 共用)
     next_save_slot: u16,
     /// ローカル変数名 → 割り当て済みバインディング
     local_bindings: HashMap<String, LocalBinding>,
@@ -109,6 +108,7 @@ impl CodeGen {
             sprite_sizes: HashMap::new(),
             enum_variant_values: HashMap::new(),
             struct_defs: HashMap::new(),
+            fn_return_types: HashMap::new(),
             next_save_slot: 0x0A0,
             local_bindings: HashMap::new(),
             next_free_reg: 0,
@@ -174,51 +174,123 @@ impl CodeGen {
         // Pass 2: 関数を生成
         for top in &program.top_levels {
             if let TopLevel::FnDef {
-                name, params, body, ..
+                name,
+                params,
+                return_type,
+                body,
+                ..
             } = top
             {
                 let addr = self.current_addr();
                 self.fn_addrs.insert(name.clone(), addr);
+                self.fn_return_types
+                    .insert(name.clone(), return_type.clone());
 
                 self.local_bindings.clear();
                 self.next_free_reg = 0;
                 self.local_var_count = 0;
 
-                for param in params {
-                    if let Type::UserType(ref type_name) = param.ty
-                        && self.struct_defs.contains_key(type_name)
-                    {
-                        let base_reg = self.alloc_register();
-                        let count = self.struct_field_count(type_name);
-                        // 追加の連続レジスタを確保
-                        for _ in 1..count {
-                            self.alloc_register();
-                        }
-                        self.local_bindings.insert(
-                            param.name.clone(),
-                            LocalBinding::Struct {
-                                base_reg,
-                                struct_name: type_name.clone(),
-                            },
-                        );
-                        continue;
+                // パラメータの合計レジスタ数を計算
+                let has_struct_param = params.iter().any(|p| {
+                    if let Type::UserType(ref tn) = p.ty {
+                        self.struct_defs.contains_key(tn)
+                    } else {
+                        false
                     }
-                    let reg = self.alloc_register();
-                    self.local_bindings
-                        .insert(param.name.clone(), LocalBinding::Single(reg));
+                });
+
+                if has_struct_param {
+                    // struct パラメータあり: 全パラメータをメモリに保存
+                    let total_param_regs: u8 = params
+                        .iter()
+                        .map(|p| {
+                            if let Type::UserType(ref tn) = p.ty
+                                && self.struct_defs.contains_key(tn)
+                            {
+                                return self.struct_field_count(tn) as u8;
+                            }
+                            1
+                        })
+                        .sum();
+
+                    let params_mem_base = self.alloc_mem_slot(total_param_regs as u16);
+
+                    // 全パラメータをメモリに一括保存
+                    if total_param_regs > 0 {
+                        self.emit_op(Opcode::LdI(Addr::new(params_mem_base)));
+                        let last_reg = UserRegister::new(total_param_regs - 1);
+                        self.emit_op(Opcode::LdIVx(last_reg.into()));
+                    }
+
+                    // 各パラメータをバインド
+                    let mut mem_offset = 0u16;
+                    for param in params {
+                        if let Type::UserType(ref type_name) = param.ty
+                            && self.struct_defs.contains_key(type_name)
+                        {
+                            let count = self.struct_field_count(type_name) as u16;
+                            self.local_bindings.insert(
+                                param.name.clone(),
+                                LocalBinding::StructInMemory {
+                                    addr: params_mem_base + mem_offset,
+                                    struct_name: type_name.clone(),
+                                },
+                            );
+                            mem_offset += count;
+                        } else {
+                            // スカラーパラメータ: メモリから再ロード
+                            let reg = self.alloc_register();
+                            self.emit_load_from_memory(reg.into(), params_mem_base + mem_offset);
+                            self.local_bindings
+                                .insert(param.name.clone(), LocalBinding::Single(reg));
+                            mem_offset += 1;
+                        }
+                    }
+                } else {
+                    // struct パラメータなし: 従来通りレジスタに直接バインド
+                    for param in params {
+                        let reg = self.alloc_register();
+                        self.local_bindings
+                            .insert(param.name.clone(), LocalBinding::Single(reg));
+                    }
                 }
                 self.local_var_count = self.next_free_reg;
 
                 // TCO 用に現在の関数情報を記録
                 self.current_fn_name = Some(name.clone());
                 self.current_fn_start_addr = Some(addr);
-                self.current_fn_param_count = params.len() as u8;
+                // TCO ジャンプ先は関数先頭なので、フラットなレジスタ数を記録
+                self.current_fn_param_count = params
+                    .iter()
+                    .map(|p| {
+                        if let Type::UserType(ref tn) = p.ty
+                            && self.struct_defs.contains_key(tn)
+                        {
+                            return self.struct_field_count(tn) as u8;
+                        }
+                        1
+                    })
+                    .sum();
 
                 let result = self.codegen_expr_tail(body);
-                if let Some(reg) = result.register()
-                    && reg != Register::V0
-                {
-                    self.emit_op(Opcode::LdReg(Register::V0, reg));
+                // struct 戻り値の場合: メモリから V0..V(n-1) にロードして返す
+                match &result {
+                    ValueLocation::InMemory {
+                        addr: mem_addr,
+                        struct_name,
+                    } => {
+                        let count = self.struct_field_count(struct_name);
+                        self.emit_op(Opcode::LdI(Addr::new(*mem_addr)));
+                        let last = UserRegister::new(count as u8 - 1);
+                        self.emit_op(Opcode::LdVxI(last.into()));
+                    }
+                    _ => {
+                        if let Some(reg) = result.register()
+                            && reg != Register::V0
+                        {
+                            self.emit_op(Opcode::LdReg(Register::V0, reg));
+                        }
+                    }
                 }
                 self.emit_op(Opcode::Ret);
 
@@ -312,7 +384,7 @@ impl CodeGen {
     fn v0_is_bound(&self) -> bool {
         self.local_bindings.values().any(|b| match b {
             LocalBinding::Single(r) => r.index() == 0,
-            LocalBinding::Struct { base_reg, .. } => base_reg.index() == 0,
+            LocalBinding::StructInMemory { .. } => false,
         })
     }
 
@@ -363,33 +435,6 @@ impl CodeGen {
             .map(|f| f.ty.clone())
     }
 
-    /// 式から struct 名を推定
-    fn infer_struct_name(&self, expr: &Expr) -> Option<String> {
-        match &expr.kind {
-            ExprKind::Ident(name) => {
-                if let Some(LocalBinding::Struct { struct_name, .. }) = self.lookup_binding(name) {
-                    Some(struct_name.clone())
-                } else {
-                    None
-                }
-            }
-            ExprKind::StructLiteral { name, .. } => Some(name.clone()),
-            ExprKind::FieldAccess {
-                expr: inner, field, ..
-            } => {
-                let parent_name = self.infer_struct_name(inner)?;
-                if let Some(field_ty) = self.struct_field_type(&parent_name, field)
-                    && let Type::UserType(name) = field_ty
-                    && self.struct_defs.contains_key(&name)
-                {
-                    return Some(name);
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
     fn emit_ld_i_global(&mut self, name: &str) {
         let offset = self.emit_placeholder();
         self.forward_refs.push(ForwardRef {
@@ -416,6 +461,54 @@ impl CodeGen {
         }
     }
 
+    /// メモリスロットを割り当て、開始アドレスを返す
+    fn alloc_mem_slot(&mut self, size: u16) -> u16 {
+        let addr = self.next_save_slot;
+        self.next_save_slot += size;
+        addr
+    }
+
+    /// メモリからレジスタに 1 バイトをロード (V0 bounce パターン)
+    fn emit_load_from_memory(&mut self, target: Register, addr: u16) {
+        self.emit_op(Opcode::LdI(Addr::new(addr)));
+        if target == Register::V0 {
+            self.emit_op(Opcode::LdVxI(Register::V0));
+        } else if self.v0_is_bound() {
+            // V0 がバインド済み: XOR swap パターン
+            self.emit_op(Opcode::LdReg(target, Register::V0));
+            self.emit_op(Opcode::LdVxI(Register::V0));
+            self.emit_op(Opcode::Xor(target, Register::V0));
+            self.emit_op(Opcode::Xor(Register::V0, target));
+            self.emit_op(Opcode::Xor(target, Register::V0));
+        } else {
+            self.emit_op(Opcode::LdVxI(Register::V0));
+            self.emit_op(Opcode::LdReg(target, Register::V0));
+        }
+    }
+
+    /// レジスタの値をメモリに 1 バイト書き込む
+    fn emit_store_to_memory(&mut self, src: Register, addr: u16) {
+        if src == Register::V0 {
+            self.emit_op(Opcode::LdI(Addr::new(addr)));
+            self.emit_op(Opcode::LdIVx(Register::V0));
+        } else if self.v0_is_bound() {
+            // V0 がバインド済み: XOR swap で V0 と src を入れ替え → 書き込み → 戻す
+            self.emit_op(Opcode::Xor(src, Register::V0));
+            self.emit_op(Opcode::Xor(Register::V0, src));
+            self.emit_op(Opcode::Xor(src, Register::V0));
+            self.emit_op(Opcode::LdI(Addr::new(addr)));
+            self.emit_op(Opcode::LdIVx(Register::V0));
+            // swap back
+            self.emit_op(Opcode::Xor(src, Register::V0));
+            self.emit_op(Opcode::Xor(Register::V0, src));
+            self.emit_op(Opcode::Xor(src, Register::V0));
+        } else {
+            self.emit_op(Opcode::LdReg(Register::V0, src));
+            self.emit_op(Opcode::LdI(Addr::new(addr)));
+            self.emit_op(Opcode::LdIVx(Register::V0));
+        }
+    }
+
     fn pattern_value(&self, pattern: &Expr) -> u8 {
         match &pattern.kind {
             ExprKind::IntLiteral(v) => *v as u8,
@@ -438,19 +531,35 @@ impl CodeGen {
                 let fn_start = self.current_fn_start_addr.unwrap();
                 let param_count = self.current_fn_param_count;
 
-                // 全引数を temp レジスタに評価
-                let mut arg_regs = Vec::new();
+                // 全引数をフラットなレジスタリストに評価
+                let mut flat_args: Vec<Register> = Vec::new();
                 for arg in args {
-                    if let Some(reg) = self.codegen_expr(arg).register() {
-                        arg_regs.push(reg);
+                    let loc = self.codegen_expr(arg);
+                    match loc {
+                        ValueLocation::InMemory {
+                            addr,
+                            ref struct_name,
+                        } => {
+                            let count = self.struct_field_count(struct_name);
+                            for i in 0..count {
+                                let reg = self.alloc_temp_register();
+                                self.emit_load_from_memory(reg.into(), addr + i as u16);
+                                flat_args.push(reg.into());
+                            }
+                        }
+                        _ => {
+                            if let Some(reg) = loc.register() {
+                                flat_args.push(reg);
+                            }
+                        }
                     }
                 }
 
-                // temp → V0, V1, ... にコピー (パラメータ上書き)
+                // flat_args → V0, V1, ... にコピー (パラメータ上書き)
                 for i in 0..param_count {
                     let target: Register = UserRegister::new(i).into();
-                    if i < arg_regs.len() as u8 && arg_regs[i as usize] != target {
-                        self.emit_op(Opcode::LdReg(target, arg_regs[i as usize]));
+                    if (i as usize) < flat_args.len() && flat_args[i as usize] != target {
+                        self.emit_op(Opcode::LdReg(target, flat_args[i as usize]));
                     }
                 }
 
@@ -527,18 +636,13 @@ impl CodeGen {
                 if let Some(binding) = self.lookup_binding(name).cloned() {
                     match binding {
                         LocalBinding::Single(reg) => ValueLocation::InRegister(reg.into()),
-                        LocalBinding::Struct {
-                            base_reg,
+                        LocalBinding::StructInMemory {
+                            addr,
                             ref struct_name,
-                        } => {
-                            let count = self.struct_field_count(struct_name);
-                            let regs: Vec<Register> = (0..count)
-                                .map(|i| {
-                                    Register::from(UserRegister::new(base_reg.index() + i as u8))
-                                })
-                                .collect();
-                            ValueLocation::InRegisters(regs)
-                        }
+                        } => ValueLocation::InMemory {
+                            addr,
+                            struct_name: struct_name.clone(),
+                        },
                     }
                 } else {
                     let reg = self.alloc_temp_register();
@@ -553,14 +657,29 @@ impl CodeGen {
                 if matches!(op, BinOp::Eq | BinOp::NotEq) {
                     let lhs_loc = self.codegen_expr(lhs);
                     let rhs_loc = self.codegen_expr(rhs);
+
+                    // InMemory 同士の比較
                     if let (
-                        ValueLocation::InRegisters(lhs_regs),
-                        ValueLocation::InRegisters(rhs_regs),
+                        ValueLocation::InMemory {
+                            addr: l_addr,
+                            struct_name: l_name,
+                        },
+                        ValueLocation::InMemory {
+                            addr: r_addr,
+                            struct_name: r_name,
+                        },
                     ) = (&lhs_loc, &rhs_loc)
                     {
-                        return self.codegen_struct_equality(lhs_regs, rhs_regs, *op == BinOp::Eq);
+                        return self.codegen_struct_equality_memory(
+                            *l_addr,
+                            l_name,
+                            *r_addr,
+                            r_name,
+                            *op == BinOp::Eq,
+                        );
                     }
-                    // struct でない場合、スカラー比較にフォールスルー
+
+                    // スカラー比較にフォールスルー
                     let Some(lhs_reg) = lhs_loc.register() else {
                         return ValueLocation::Void;
                     };
@@ -679,11 +798,28 @@ impl CodeGen {
             }
             ExprKind::BuiltinCall { builtin, args } => self.codegen_builtin_call(*builtin, args),
             ExprKind::Call { name, args } => {
-                // ユーザー定義関数: 引数を評価して V0, V1, ... にコピー
-                let mut arg_regs = Vec::new();
+                // ユーザー定義関数: 引数を評価してフラットなレジスタリストを構築
+                let mut flat_args: Vec<Register> = Vec::new();
                 for arg in args {
-                    if let Some(reg) = self.codegen_expr(arg).register() {
-                        arg_regs.push(reg);
+                    let loc = self.codegen_expr(arg);
+                    match loc {
+                        ValueLocation::InMemory {
+                            addr,
+                            ref struct_name,
+                        } => {
+                            // struct 引数: メモリからフィールドを1つずつロード
+                            let count = self.struct_field_count(struct_name);
+                            for i in 0..count {
+                                let reg = self.alloc_temp_register();
+                                self.emit_load_from_memory(reg.into(), addr + i as u16);
+                                flat_args.push(reg.into());
+                            }
+                        }
+                        _ => {
+                            if let Some(reg) = loc.register() {
+                                flat_args.push(reg);
+                            }
+                        }
                     }
                 }
                 let num_to_save = self.local_var_count;
@@ -698,7 +834,7 @@ impl CodeGen {
                 }
 
                 // 引数を V0, V1, ... にコピー
-                for (i, &arg_reg) in arg_regs.iter().enumerate() {
+                for (i, &arg_reg) in flat_args.iter().enumerate() {
                     let target: Register = UserRegister::new(i as u8).into();
                     if arg_reg != target {
                         self.emit_op(Opcode::LdReg(target, arg_reg));
@@ -712,19 +848,56 @@ impl CodeGen {
                     kind: ForwardRefKind::Call(name.clone()),
                 });
 
-                // 戻り値を退避してからレジスタを復帰
-                let result_reg = if num_to_save > 0 {
-                    let temp = UserRegister::new(num_to_save);
-                    self.emit_op(Opcode::LdReg(temp.into(), Register::V0));
-                    self.emit_op(Opcode::LdI(Addr::new(save_addr)));
-                    let last_reg = UserRegister::new(num_to_save - 1);
-                    self.emit_op(Opcode::LdVxI(last_reg.into()));
-                    temp.into()
+                // 戻り値が struct 型かチェック
+                let return_type = self.fn_return_types.get(name).cloned();
+                let is_struct_return = if let Some(Type::UserType(ref tn)) = return_type {
+                    self.struct_defs.contains_key(tn)
                 } else {
-                    Register::V0
+                    false
                 };
 
-                ValueLocation::InRegister(result_reg)
+                if is_struct_return {
+                    let ret_struct_name = if let Some(Type::UserType(ref tn)) = return_type {
+                        tn.clone()
+                    } else {
+                        unreachable!()
+                    };
+                    let ret_count = self.struct_field_count(&ret_struct_name);
+
+                    // 戻り値 (V0..V(n-1)) をメモリに保存
+                    let ret_addr = self.alloc_mem_slot(ret_count as u16);
+
+                    // caller-save の復帰前に struct 戻り値をメモリに退避
+                    self.emit_op(Opcode::LdI(Addr::new(ret_addr)));
+                    let last = UserRegister::new(ret_count as u8 - 1);
+                    self.emit_op(Opcode::LdIVx(last.into()));
+
+                    // caller-save 復帰
+                    if num_to_save > 0 {
+                        self.emit_op(Opcode::LdI(Addr::new(save_addr)));
+                        let last_reg = UserRegister::new(num_to_save - 1);
+                        self.emit_op(Opcode::LdVxI(last_reg.into()));
+                    }
+
+                    ValueLocation::InMemory {
+                        addr: ret_addr,
+                        struct_name: ret_struct_name,
+                    }
+                } else {
+                    // スカラー戻り値: 従来通り
+                    let result_reg = if num_to_save > 0 {
+                        let temp = UserRegister::new(num_to_save);
+                        self.emit_op(Opcode::LdReg(temp.into(), Register::V0));
+                        self.emit_op(Opcode::LdI(Addr::new(save_addr)));
+                        let last_reg = UserRegister::new(num_to_save - 1);
+                        self.emit_op(Opcode::LdVxI(last_reg.into()));
+                        temp.into()
+                    } else {
+                        Register::V0
+                    };
+
+                    ValueLocation::InRegister(result_reg)
+                }
             }
             ExprKind::If {
                 cond,
@@ -837,118 +1010,105 @@ impl CodeGen {
                 let field_count = self.struct_field_count(name);
                 let struct_fields = self.struct_defs.get(name).cloned().unwrap_or_default();
 
-                // 結果用の連続レジスタを確保
-                let base_reg = self.alloc_temp_register();
-                for _ in 1..field_count {
-                    self.alloc_temp_register();
-                }
-                let result_regs: Vec<Register> = (0..field_count)
-                    .map(|i| UserRegister::new(base_reg.index() + i as u8).into())
-                    .collect();
+                // メモリスロットを割り当て
+                let struct_addr = self.alloc_mem_slot(field_count as u16);
 
-                // base がある場合、先にコピー
+                // base がある場合、メモリを一括コピー
                 if let Some(base_expr) = base {
                     let base_loc = self.codegen_expr(base_expr);
-                    if let ValueLocation::InRegisters(ref src_regs) = base_loc {
-                        for (i, &src) in src_regs.iter().enumerate() {
-                            if i < result_regs.len() && src != result_regs[i] {
-                                self.emit_op(Opcode::LdReg(result_regs[i], src));
-                            }
-                        }
+                    if let ValueLocation::InMemory { addr: src_addr, .. } = base_loc {
+                        // メモリ → メモリ: V0..V(n-1) 経由でコピー
+                        self.emit_op(Opcode::LdI(Addr::new(src_addr)));
+                        let last = UserRegister::new(field_count as u8 - 1);
+                        self.emit_op(Opcode::LdVxI(last.into()));
+                        self.emit_op(Opcode::LdI(Addr::new(struct_addr)));
+                        self.emit_op(Opcode::LdIVx(last.into()));
                     }
                 }
 
-                // 各フィールドの値を該当するレジスタに設定
+                // 各フィールドの値を評価してメモリに書き込み
                 for (field_name, value_expr) in fields {
                     if let Some(offset) = self.struct_field_offset(name, field_name) {
-                        // フィールドが struct 型の場合
                         let field_ty = struct_fields
                             .iter()
                             .find(|f| &f.name == field_name)
                             .map(|f| &f.ty);
+
                         if let Some(Type::UserType(sub_name)) = field_ty
                             && self.struct_defs.contains_key(sub_name)
                         {
+                            // struct 型フィールド
                             let val_loc = self.codegen_expr(value_expr);
-                            if let ValueLocation::InRegisters(ref src_regs) = val_loc {
-                                let sub_count = self.struct_field_count(sub_name);
-                                for i in 0..sub_count.min(src_regs.len()) {
-                                    if src_regs[i] != result_regs[offset + i] {
-                                        self.emit_op(Opcode::LdReg(
-                                            result_regs[offset + i],
-                                            src_regs[i],
-                                        ));
-                                    }
-                                }
+                            let sub_count = self.struct_field_count(sub_name);
+                            if let ValueLocation::InMemory { addr: src_addr, .. } = val_loc {
+                                self.emit_op(Opcode::LdI(Addr::new(src_addr)));
+                                let last = UserRegister::new(sub_count as u8 - 1);
+                                self.emit_op(Opcode::LdVxI(last.into()));
+                                self.emit_op(Opcode::LdI(Addr::new(struct_addr + offset as u16)));
+                                self.emit_op(Opcode::LdIVx(last.into()));
                             }
                             continue;
                         }
-                        // スカラーフィールド
-                        if let Some(val_reg) = self.codegen_expr(value_expr).register()
-                            && val_reg != result_regs[offset]
-                        {
-                            self.emit_op(Opcode::LdReg(result_regs[offset], val_reg));
+
+                        // スカラーフィールド: 評価してメモリにストア
+                        if let Some(val_reg) = self.codegen_expr(value_expr).register() {
+                            self.emit_store_to_memory(val_reg, struct_addr + offset as u16);
                         }
                     }
                 }
 
-                ValueLocation::InRegisters(result_regs)
+                ValueLocation::InMemory {
+                    addr: struct_addr,
+                    struct_name: name.clone(),
+                }
             }
             ExprKind::FieldAccess { expr: inner, field } => {
                 let inner_loc = self.codegen_expr(inner);
                 match inner_loc {
-                    ValueLocation::InRegisters(ref regs) => {
-                        // inner の型から struct 名を推定する必要がある
-                        // Ident の場合は local_bindings から取得
-                        let struct_name = self.infer_struct_name(inner);
-                        if let Some(ref sn) = struct_name
-                            && let Some(offset) = self.struct_field_offset(sn, field)
-                        {
-                            // フィールドが struct の場合、複数レジスタを返す
-                            if let Some(field_ty) = self.struct_field_type(sn, field)
+                    ValueLocation::InMemory {
+                        addr,
+                        ref struct_name,
+                    } => {
+                        let sn = struct_name.clone();
+                        if let Some(offset) = self.struct_field_offset(&sn, field) {
+                            // フィールドが struct 型の場合、InMemory を返す
+                            if let Some(field_ty) = self.struct_field_type(&sn, field)
                                 && let Type::UserType(ref sub_name) = field_ty
                                 && self.struct_defs.contains_key(sub_name)
                             {
-                                let sub_count = self.struct_field_count(sub_name);
-                                let sub_regs: Vec<Register> =
-                                    (0..sub_count).map(|i| regs[offset + i]).collect();
-                                return ValueLocation::InRegisters(sub_regs);
+                                return ValueLocation::InMemory {
+                                    addr: addr + offset as u16,
+                                    struct_name: sub_name.clone(),
+                                };
                             }
-                            if offset < regs.len() {
-                                return ValueLocation::InRegister(regs[offset]);
-                            }
+                            // スカラーフィールド: メモリからテンプレジスタにロード
+                            let reg = self.alloc_temp_register();
+                            self.emit_load_from_memory(reg.into(), addr + offset as u16);
+                            return ValueLocation::InRegister(reg.into());
                         }
                         ValueLocation::Void
                     }
                     _ => {
-                        // single register binding for struct (lookup from local bindings)
+                        // StructInMemory binding のフィールドアクセス
                         if let ExprKind::Ident(name) = &inner.kind
-                            && let Some(LocalBinding::Struct {
-                                base_reg,
-                                struct_name,
+                            && let Some(LocalBinding::StructInMemory {
+                                addr,
+                                ref struct_name,
                             }) = self.lookup_binding(name).cloned()
+                            && let Some(offset) = self.struct_field_offset(struct_name, field)
                         {
-                            let count = self.struct_field_count(&struct_name);
-                            let regs: Vec<Register> = (0..count)
-                                .map(|i| {
-                                    Register::from(UserRegister::new(base_reg.index() + i as u8))
-                                })
-                                .collect();
-                            if let Some(offset) = self.struct_field_offset(&struct_name, field) {
-                                // フィールドが struct 型かチェック
-                                if let Some(field_ty) = self.struct_field_type(&struct_name, field)
-                                    && let Type::UserType(ref sub_name) = field_ty
-                                    && self.struct_defs.contains_key(sub_name)
-                                {
-                                    let sub_count = self.struct_field_count(sub_name);
-                                    let sub_regs: Vec<Register> =
-                                        (0..sub_count).map(|i| regs[offset + i]).collect();
-                                    return ValueLocation::InRegisters(sub_regs);
-                                }
-                                if offset < regs.len() {
-                                    return ValueLocation::InRegister(regs[offset]);
-                                }
+                            if let Some(field_ty) = self.struct_field_type(struct_name, field)
+                                && let Type::UserType(ref sub_name) = field_ty
+                                && self.struct_defs.contains_key(sub_name)
+                            {
+                                return ValueLocation::InMemory {
+                                    addr: addr + offset as u16,
+                                    struct_name: sub_name.clone(),
+                                };
                             }
+                            let reg = self.alloc_temp_register();
+                            self.emit_load_from_memory(reg.into(), addr + offset as u16);
+                            return ValueLocation::InRegister(reg.into());
                         }
                         ValueLocation::Void
                     }
@@ -984,41 +1144,40 @@ impl CodeGen {
         }
     }
 
-    /// 組み込み関数のコード生成 (exhaustive match で全バリアントをカバー)
-    /// struct の等値比較: フィールドごとに比較し AND (eq) / OR (neq) で集約
-    fn codegen_struct_equality(
+    /// メモリ上の struct 同士の等値比較
+    fn codegen_struct_equality_memory(
         &mut self,
-        lhs_regs: &[Register],
-        rhs_regs: &[Register],
+        l_addr: u16,
+        l_name: &str,
+        r_addr: u16,
+        _r_name: &str,
         is_eq: bool,
     ) -> ValueLocation {
+        let count = self.struct_field_count(l_name);
         let res = self.alloc_temp_register();
 
-        if lhs_regs.is_empty() {
-            // 空 struct: 常に等しい
+        if count == 0 {
             self.emit_op(Opcode::LdImm(res.into(), if is_eq { 1 } else { 0 }));
             return ValueLocation::InRegister(res.into());
         }
 
-        // 最初のフィールド比較で結果を初期化
-        self.emit_op(Opcode::LdImm(res.into(), 0));
-        self.emit_op(Opcode::SeReg(lhs_regs[0], rhs_regs[0]));
-        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+        // res = 1 (仮に全フィールドが等しいと仮定)
         self.emit_op(Opcode::LdImm(res.into(), 1));
-        // res = 1 if lhs[0] == rhs[0], 0 otherwise
 
-        // 残りのフィールドについて AND で集約
-        for i in 1..lhs_regs.len().min(rhs_regs.len()) {
-            let tmp = self.alloc_temp_register();
-            self.emit_op(Opcode::LdImm(tmp.into(), 0));
-            self.emit_op(Opcode::SeReg(lhs_regs[i], rhs_regs[i]));
-            self.emit_op(Opcode::Jp(self.skip_next_addr()));
-            self.emit_op(Opcode::LdImm(tmp.into(), 1));
-            // res &= tmp (AND)
-            self.emit_op(Opcode::And(res.into(), tmp.into()));
+        for i in 0..count {
+            // 左辺フィールドをロード
+            let l_reg = self.alloc_temp_register();
+            self.emit_load_from_memory(l_reg.into(), l_addr + i as u16);
+            // 右辺フィールドをロード
+            let r_reg = self.alloc_temp_register();
+            self.emit_load_from_memory(r_reg.into(), r_addr + i as u16);
+            // 比較: 不一致なら res = 0
+            self.emit_op(Opcode::SeReg(l_reg.into(), r_reg.into()));
+            self.emit_op(Opcode::LdImm(res.into(), 0));
+            // テンプレジスタを解放 (res の次まで巻き戻し)
+            self.next_free_reg = res.index() + 1;
         }
 
-        // is_eq=false (NotEq) なら結果を反転: res = res XOR 1
         if !is_eq {
             let one = self.alloc_temp_register();
             self.emit_op(Opcode::LdImm(one.into(), 1));
@@ -1174,32 +1333,19 @@ impl CodeGen {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
                 let val_loc = self.codegen_expr(value);
-                // struct 型の let: 連続レジスタをバインド
+                // struct 型の let
                 if let Type::UserType(type_name) = ty
                     && self.struct_defs.contains_key(type_name)
-                    && let ValueLocation::InRegisters(ref regs) = val_loc
+                    && let ValueLocation::InMemory { addr, .. } = val_loc
                 {
-                    let count = self.struct_field_count(type_name);
-                    self.next_free_reg = self.local_var_count;
-                    let base_reg = self.alloc_register();
-                    for _ in 1..count {
-                        self.alloc_register();
-                    }
-                    // 値をコピー
-                    for (i, &src_reg) in regs.iter().enumerate() {
-                        let dst: Register = UserRegister::new(base_reg.index() + i as u8).into();
-                        if src_reg != dst {
-                            self.emit_op(Opcode::LdReg(dst, src_reg));
-                        }
-                    }
+                    // すでにメモリにある: そのままバインド
                     self.local_bindings.insert(
                         name.clone(),
-                        LocalBinding::Struct {
-                            base_reg,
+                        LocalBinding::StructInMemory {
+                            addr,
                             struct_name: type_name.clone(),
                         },
                     );
-                    self.local_var_count = self.next_free_reg;
                     return;
                 }
                 // スカラー型の let
@@ -1216,7 +1362,31 @@ impl CodeGen {
                 }
             }
             StmtKind::Assign { name, value } => {
-                if let Some(val_reg) = self.codegen_expr(value).register()
+                let val_loc = self.codegen_expr(value);
+                // struct 変数への代入
+                if let Some(LocalBinding::StructInMemory {
+                    addr: target_addr, ..
+                }) = self.local_bindings.get(name).cloned()
+                {
+                    match val_loc {
+                        ValueLocation::InMemory {
+                            addr: src_addr,
+                            ref struct_name,
+                        } => {
+                            let count = self.struct_field_count(struct_name);
+                            self.emit_op(Opcode::LdI(Addr::new(src_addr)));
+                            let last = UserRegister::new(count as u8 - 1);
+                            self.emit_op(Opcode::LdVxI(last.into()));
+                            self.emit_op(Opcode::LdI(Addr::new(target_addr)));
+                            self.emit_op(Opcode::LdIVx(last.into()));
+                        }
+                        _ => {
+                            if let Some(val_reg) = val_loc.register() {
+                                self.emit_store_to_memory(val_reg, target_addr);
+                            }
+                        }
+                    }
+                } else if let Some(val_reg) = val_loc.register()
                     && let Some(LocalBinding::Single(target_reg)) = self.local_bindings.get(name)
                 {
                     let target: Register = (*target_reg).into();
@@ -1229,11 +1399,26 @@ impl CodeGen {
                 self.codegen_expr(expr);
             }
             StmtKind::Return(expr) => {
-                if let Some(e) = expr
-                    && let Some(reg) = self.codegen_expr(e).register()
-                    && reg != Register::V0
-                {
-                    self.emit_op(Opcode::LdReg(Register::V0, reg));
+                if let Some(e) = expr {
+                    let loc = self.codegen_expr(e);
+                    match loc {
+                        ValueLocation::InMemory {
+                            addr, struct_name, ..
+                        } => {
+                            // struct 戻り値: メモリから V0..V(n-1) にロード
+                            let count = self.struct_field_count(&struct_name);
+                            self.emit_op(Opcode::LdI(Addr::new(addr)));
+                            let last = UserRegister::new(count as u8 - 1);
+                            self.emit_op(Opcode::LdVxI(last.into()));
+                        }
+                        _ => {
+                            if let Some(reg) = loc.register()
+                                && reg != Register::V0
+                            {
+                                self.emit_op(Opcode::LdReg(Register::V0, reg));
+                            }
+                        }
+                    }
                 }
                 self.emit_op(Opcode::Ret);
             }
