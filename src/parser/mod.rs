@@ -185,6 +185,10 @@ impl Parser {
     fn parse_let_def(&mut self) -> Result<TopLevel, ParseError> {
         let span = self.current_span();
         self.expect(&TokenKind::Let)?;
+        let mutable = *self.peek() == TokenKind::Mut;
+        if mutable {
+            self.advance();
+        }
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::Colon)?;
         let ty = self.parse_type()?;
@@ -195,6 +199,7 @@ impl Parser {
             name,
             ty,
             value,
+            mutable,
             span,
         })
     }
@@ -346,17 +351,41 @@ impl Parser {
             }
             _ => {
                 let expr = self.parse_expr()?;
-                // 代入: ident = expr;
-                if self.peek() == &TokenKind::Eq
-                    && let ExprKind::Ident(name) = expr.kind
-                {
-                    self.advance(); // '='
-                    let value = self.parse_expr()?;
-                    self.expect(&TokenKind::Semicolon)?;
-                    return Ok(Stmt {
-                        kind: StmtKind::Assign { name, value },
-                        span,
-                    });
+                if self.peek() == &TokenKind::Eq {
+                    if matches!(&expr.kind, ExprKind::Ident(_)) {
+                        let ExprKind::Ident(name) = expr.kind else {
+                            unreachable!()
+                        };
+                        self.advance(); // '='
+                        let value = self.parse_expr()?;
+                        self.expect(&TokenKind::Semicolon)?;
+                        return Ok(Stmt {
+                            kind: StmtKind::Assign { name, value },
+                            span,
+                        });
+                    }
+                    if matches!(
+                        &expr.kind,
+                        ExprKind::Index { array, .. } if matches!(&array.kind, ExprKind::Ident(_))
+                    ) {
+                        let ExprKind::Index { array, index } = expr.kind else {
+                            unreachable!()
+                        };
+                        let ExprKind::Ident(array_name) = array.kind else {
+                            unreachable!()
+                        };
+                        self.advance(); // '='
+                        let value = self.parse_expr()?;
+                        self.expect(&TokenKind::Semicolon)?;
+                        return Ok(Stmt {
+                            kind: StmtKind::IndexAssign {
+                                array: array_name,
+                                index: *index,
+                                value,
+                            },
+                            span,
+                        });
+                    }
                 }
                 self.expect(&TokenKind::Semicolon)?;
                 Ok(Stmt {
@@ -678,12 +707,36 @@ impl Parser {
                 });
             } else if self.peek() == &TokenKind::Eq {
                 // 代入文
-                if let ExprKind::Ident(name) = expr.kind {
+                if matches!(&expr.kind, ExprKind::Ident(_)) {
+                    let ExprKind::Ident(name) = expr.kind else {
+                        unreachable!()
+                    };
                     self.advance();
                     let value = self.parse_expr()?;
                     self.expect(&TokenKind::Semicolon)?;
                     stmts.push(Stmt {
                         kind: StmtKind::Assign { name, value },
+                        span: self.tokens[checkpoint].span,
+                    });
+                } else if matches!(
+                    &expr.kind,
+                    ExprKind::Index { array, .. } if matches!(&array.kind, ExprKind::Ident(_))
+                ) {
+                    let ExprKind::Index { array, index } = expr.kind else {
+                        unreachable!()
+                    };
+                    let ExprKind::Ident(array_name) = array.kind else {
+                        unreachable!()
+                    };
+                    self.advance();
+                    let value = self.parse_expr()?;
+                    self.expect(&TokenKind::Semicolon)?;
+                    stmts.push(Stmt {
+                        kind: StmtKind::IndexAssign {
+                            array: array_name,
+                            index: *index,
+                            value,
+                        },
                         span: self.tokens[checkpoint].span,
                     });
                 } else {

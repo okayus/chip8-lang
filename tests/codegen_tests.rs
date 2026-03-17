@@ -568,3 +568,89 @@ fn test_struct_update_memory() {
     );
     assert!(bytes.len() >= 4);
 }
+
+#[test]
+fn test_if_else_returns_struct_from_memory() {
+    // #40: if-else で struct (InMemory) を返す場合のバグ修正
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn choose(c: bool, a: Pos, b: Pos) -> Pos {
+            if c { a } else { b }
+         }
+         fn main() -> u8 {
+            let p: Pos = choose(true, Pos { x: 1, y: 2 }, Pos { x: 3, y: 4 });
+            p.x
+         }",
+    );
+    assert!(bytes.len() >= 4);
+}
+
+#[test]
+fn test_mul_compiles() {
+    let bytes = compile(
+        "fn main() -> u8 {
+            let a: u8 = 3;
+            let b: u8 = 4;
+            a * b
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // JP 命令が含まれること (ループ)
+    let jp_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x10).count();
+    assert!(jp_count >= 2, "expected JP instructions for mul loop");
+}
+
+#[test]
+fn test_div_compiles() {
+    let bytes = compile(
+        "fn main() -> u8 {
+            let a: u8 = 12;
+            let b: u8 = 3;
+            a / b
+         }",
+    );
+    assert!(bytes.len() >= 4);
+}
+
+#[test]
+fn test_mod_compiles() {
+    let bytes = compile(
+        "fn main() -> u8 {
+            let a: u8 = 10;
+            let b: u8 = 3;
+            a % b
+         }",
+    );
+    assert!(bytes.len() >= 4);
+}
+
+#[test]
+fn test_mutable_global_read_write() {
+    let bytes = compile(
+        "let mut score: u8 = 0;
+         fn add_score(points: u8) -> () {
+            score = score + points;
+         }
+         fn main() -> () {
+            add_score(10);
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // FX55 (LdIVx) が含まれること (グローバル書き込み)
+    let has_fx55 = bytes.chunks(2).any(|c| (c[1] & 0xFF) == 0x55);
+    assert!(has_fx55, "expected FX55 instruction for global write");
+}
+
+#[test]
+fn test_array_index_assign_compiles() {
+    let bytes = compile(
+        "let mut board: [u8; 4] = [0, 0, 0, 0];
+         fn main() -> () {
+            board[2] = 42;
+         }",
+    );
+    assert!(bytes.len() >= 4);
+    // FX1E (AddI) が含まれること (インデックス計算)
+    let has_fx1e = bytes.chunks(2).any(|c| (c[1] & 0xFF) == 0x1E);
+    assert!(has_fx1e, "expected FX1E instruction for index calculation");
+}

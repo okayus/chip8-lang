@@ -21,6 +21,7 @@ pub enum TokenKind {
     Match,
     Enum,
     Struct,
+    Mut,
 
     // リテラル
     IntLiteral(u64),

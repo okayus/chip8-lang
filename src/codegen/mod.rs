@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::chip8::{Addr, ByteOffset, Opcode, Register, SpriteHeight, UserRegister};
 use crate::parser::ast::*;
@@ -73,6 +73,8 @@ pub struct CodeGen {
     sprite_sizes: HashMap<String, usize>,
     /// enum variant → u8 値
     enum_variant_values: HashMap<(String, String), u8>,
+    /// ミュータブルグローバル変数
+    mutable_globals: HashSet<String>,
     /// struct 定義 (名前 → フィールド定義リスト)
     struct_defs: HashMap<String, Vec<StructField>>,
     /// 関数の戻り値型 (struct 戻り値のメモリ化に使用)
@@ -107,6 +109,7 @@ impl CodeGen {
             resolved_addrs: HashMap::new(),
             sprite_sizes: HashMap::new(),
             enum_variant_values: HashMap::new(),
+            mutable_globals: HashSet::new(),
             struct_defs: HashMap::new(),
             fn_return_types: HashMap::new(),
             next_save_slot: 0x0A0,
@@ -142,9 +145,16 @@ impl CodeGen {
         // Pass 1: グローバル定数・スプライトをデータとして記録
         for top in &program.top_levels {
             if let TopLevel::LetDef {
-                name, ty, value, ..
+                name,
+                ty,
+                value,
+                mutable,
+                ..
             } = top
             {
+                if *mutable {
+                    self.mutable_globals.insert(name.clone());
+                }
                 let data_offset = self.data.len();
                 match &value.kind {
                     ExprKind::ArrayLiteral(elems) => {
@@ -461,6 +471,28 @@ impl CodeGen {
         }
     }
 
+    fn emit_global_write(&mut self, name: &str, src_reg: Register) {
+        if src_reg == Register::V0 {
+            self.emit_ld_i_global(name);
+            self.emit_op(Opcode::LdIVx(Register::V0));
+        } else if self.v0_is_bound() {
+            // V0 を退避して値を書き込み
+            self.emit_op(Opcode::Xor(src_reg, Register::V0));
+            self.emit_op(Opcode::Xor(Register::V0, src_reg));
+            self.emit_op(Opcode::Xor(src_reg, Register::V0));
+            self.emit_ld_i_global(name);
+            self.emit_op(Opcode::LdIVx(Register::V0));
+            // V0 を復帰
+            self.emit_op(Opcode::Xor(src_reg, Register::V0));
+            self.emit_op(Opcode::Xor(Register::V0, src_reg));
+            self.emit_op(Opcode::Xor(src_reg, Register::V0));
+        } else {
+            self.emit_op(Opcode::LdReg(Register::V0, src_reg));
+            self.emit_ld_i_global(name);
+            self.emit_op(Opcode::LdIVx(Register::V0));
+        }
+    }
+
     /// メモリスロットを割り当て、開始アドレスを返す
     fn alloc_mem_slot(&mut self, size: u16) -> u16 {
         let addr = self.next_save_slot;
@@ -582,6 +614,19 @@ impl CodeGen {
                 let then_loc = self.codegen_expr_tail(then_block);
 
                 if let Some(else_block) = else_block {
+                    // then ブランチの InMemory → V0..V(n-1) にロード
+                    let then_is_memory = matches!(&then_loc, ValueLocation::InMemory { .. });
+                    if let ValueLocation::InMemory {
+                        addr,
+                        ref struct_name,
+                    } = then_loc
+                    {
+                        let count = self.struct_field_count(struct_name);
+                        self.emit_op(Opcode::LdI(Addr::new(addr)));
+                        let last = UserRegister::new(count as u8 - 1);
+                        self.emit_op(Opcode::LdVxI(last.into()));
+                    }
+
                     let jp_end_offset = self.emit_placeholder();
 
                     let else_addr = self.current_addr();
@@ -589,10 +634,26 @@ impl CodeGen {
 
                     let else_loc = self.codegen_expr_tail(else_block);
 
+                    // else ブランチの InMemory → V0..V(n-1) にロード
+                    let else_is_memory = matches!(&else_loc, ValueLocation::InMemory { .. });
+                    if let ValueLocation::InMemory {
+                        addr,
+                        ref struct_name,
+                    } = else_loc
+                    {
+                        let count = self.struct_field_count(struct_name);
+                        self.emit_op(Opcode::LdI(Addr::new(addr)));
+                        let last = UserRegister::new(count as u8 - 1);
+                        self.emit_op(Opcode::LdVxI(last.into()));
+                    }
+
                     let end_addr = self.current_addr();
                     self.patch_at(jp_end_offset, Opcode::Jp(end_addr));
 
                     match (then_loc, else_loc) {
+                        _ if then_is_memory || else_is_memory => {
+                            ValueLocation::InRegister(Register::V0)
+                        }
                         (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
                         (ValueLocation::InRegister(r), _) => ValueLocation::InRegister(r),
                         _ => ValueLocation::Void,
@@ -715,7 +776,64 @@ impl CodeGen {
                     BinOp::Sub => {
                         self.emit_op(Opcode::Sub(lhs_reg, rhs_reg));
                     }
-                    BinOp::Mul | BinOp::Div | BinOp::Mod => {}
+                    BinOp::Mul => {
+                        // ソフトウェア乗算: result += lhs を rhs 回繰り返す
+                        let result = self.alloc_temp_register();
+                        let counter = self.alloc_temp_register();
+                        let one = self.alloc_temp_register();
+                        self.emit_op(Opcode::LdImm(result.into(), 0));
+                        self.emit_op(Opcode::LdReg(counter.into(), rhs_reg));
+                        self.emit_op(Opcode::LdImm(one.into(), 1));
+                        let loop_addr = self.current_addr();
+                        // counter == 0 なら終了
+                        self.emit_op(Opcode::SeImm(counter.into(), 0));
+                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+                        let jp_break = self.emit_placeholder();
+                        self.emit_op(Opcode::Add(result.into(), lhs_reg));
+                        self.emit_op(Opcode::Sub(counter.into(), one.into()));
+                        self.emit_op(Opcode::Jp(loop_addr));
+                        let break_addr = self.current_addr();
+                        self.patch_at(jp_break, Opcode::Jp(break_addr));
+                        return ValueLocation::InRegister(result.into());
+                    }
+                    BinOp::Div => {
+                        // ソフトウェア除算: lhs から rhs を引ける回数を数える
+                        let quotient = self.alloc_temp_register();
+                        let tmp = self.alloc_temp_register();
+                        self.emit_op(Opcode::LdImm(quotient.into(), 0));
+                        self.emit_op(Opcode::LdReg(tmp.into(), lhs_reg));
+                        let loop_addr = self.current_addr();
+                        // tmp -= rhs, VF=1 なら borrow なし (tmp >= rhs)
+                        self.emit_op(Opcode::Sub(tmp.into(), rhs_reg));
+                        // VF == 0 (borrow) なら終了
+                        self.emit_op(Opcode::SneImm(Register::VF, 0));
+                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+                        let jp_break = self.emit_placeholder();
+                        let one = self.alloc_temp_register();
+                        self.emit_op(Opcode::LdImm(one.into(), 1));
+                        self.emit_op(Opcode::Add(quotient.into(), one.into()));
+                        self.emit_op(Opcode::Jp(loop_addr));
+                        let break_addr = self.current_addr();
+                        self.patch_at(jp_break, Opcode::Jp(break_addr));
+                        return ValueLocation::InRegister(quotient.into());
+                    }
+                    BinOp::Mod => {
+                        // ソフトウェア剰余: lhs から rhs を引き続け、残りを返す
+                        let tmp = self.alloc_temp_register();
+                        self.emit_op(Opcode::LdReg(tmp.into(), lhs_reg));
+                        let loop_addr = self.current_addr();
+                        self.emit_op(Opcode::Sub(tmp.into(), rhs_reg));
+                        // VF == 0 (borrow) なら tmp < rhs だった → 戻して終了
+                        self.emit_op(Opcode::SneImm(Register::VF, 0));
+                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+                        let jp_break = self.emit_placeholder();
+                        self.emit_op(Opcode::Jp(loop_addr));
+                        let break_addr = self.current_addr();
+                        self.patch_at(jp_break, Opcode::Jp(break_addr));
+                        // SUB で壊れた tmp に rhs を足し戻す
+                        self.emit_op(Opcode::Add(tmp.into(), rhs_reg));
+                        return ValueLocation::InRegister(tmp.into());
+                    }
                     // Eq/NotEq は上で早期リターン済み
                     BinOp::Eq | BinOp::NotEq => unreachable!(),
                     BinOp::Lt => {
@@ -913,6 +1031,19 @@ impl CodeGen {
                 let then_loc = self.codegen_expr(then_block);
 
                 if let Some(else_block) = else_block {
+                    // then ブランチの InMemory → V0..V(n-1) にロード
+                    let then_is_memory = matches!(&then_loc, ValueLocation::InMemory { .. });
+                    if let ValueLocation::InMemory {
+                        addr,
+                        ref struct_name,
+                    } = then_loc
+                    {
+                        let count = self.struct_field_count(struct_name);
+                        self.emit_op(Opcode::LdI(Addr::new(addr)));
+                        let last = UserRegister::new(count as u8 - 1);
+                        self.emit_op(Opcode::LdVxI(last.into()));
+                    }
+
                     let jp_end_offset = self.emit_placeholder();
 
                     let else_addr = self.current_addr();
@@ -920,12 +1051,26 @@ impl CodeGen {
 
                     let else_loc = self.codegen_expr(else_block);
 
-                    if let (Some(_tr), Some(_er)) = (then_loc.register(), else_loc.register()) {}
+                    // else ブランチの InMemory → V0..V(n-1) にロード
+                    let else_is_memory = matches!(&else_loc, ValueLocation::InMemory { .. });
+                    if let ValueLocation::InMemory {
+                        addr,
+                        ref struct_name,
+                    } = else_loc
+                    {
+                        let count = self.struct_field_count(struct_name);
+                        self.emit_op(Opcode::LdI(Addr::new(addr)));
+                        let last = UserRegister::new(count as u8 - 1);
+                        self.emit_op(Opcode::LdVxI(last.into()));
+                    }
 
                     let end_addr = self.current_addr();
                     self.patch_at(jp_end_offset, Opcode::Jp(end_addr));
 
                     match (then_loc, else_loc) {
+                        _ if then_is_memory || else_is_memory => {
+                            ValueLocation::InRegister(Register::V0)
+                        }
                         (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
                         (ValueLocation::InRegister(r), _) => ValueLocation::InRegister(r),
                         _ => ValueLocation::Void,
@@ -1393,6 +1538,43 @@ impl CodeGen {
                     if val_reg != target {
                         self.emit_op(Opcode::LdReg(target, val_reg));
                     }
+                } else if let Some(val_reg) = val_loc.register()
+                    && self.mutable_globals.contains(name)
+                {
+                    // ミュータブルグローバル変数への書き込み
+                    self.emit_global_write(name, val_reg);
+                }
+            }
+            StmtKind::IndexAssign {
+                array,
+                index,
+                value,
+            } => {
+                let Some(idx_reg) = self.codegen_expr(index).register() else {
+                    return;
+                };
+                let Some(val_reg) = self.codegen_expr(value).register() else {
+                    return;
+                };
+                // V0 に値をセット → I = base + index → FX55 で書き込み
+                if val_reg == Register::V0 {
+                    self.emit_ld_i_global(array);
+                    self.emit_op(Opcode::AddI(idx_reg));
+                    self.emit_op(Opcode::LdIVx(Register::V0));
+                } else if self.v0_is_bound() {
+                    // V0 退避 → 値を V0 に → 書き込み → V0 復帰
+                    let tmp = self.alloc_temp_register();
+                    self.emit_op(Opcode::LdReg(tmp.into(), Register::V0));
+                    self.emit_op(Opcode::LdReg(Register::V0, val_reg));
+                    self.emit_ld_i_global(array);
+                    self.emit_op(Opcode::AddI(idx_reg));
+                    self.emit_op(Opcode::LdIVx(Register::V0));
+                    self.emit_op(Opcode::LdReg(Register::V0, tmp.into()));
+                } else {
+                    self.emit_op(Opcode::LdReg(Register::V0, val_reg));
+                    self.emit_ld_i_global(array);
+                    self.emit_op(Opcode::AddI(idx_reg));
+                    self.emit_op(Opcode::LdIVx(Register::V0));
                 }
             }
             StmtKind::Expr(expr) => {
