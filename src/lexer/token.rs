@@ -21,7 +21,6 @@ pub enum TokenKind {
 
     // リテラル
     IntLiteral(u64),
-    BinaryLiteral(Vec<u8>),
 
     // 識別子
     Ident(String),

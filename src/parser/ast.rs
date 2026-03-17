@@ -60,6 +60,10 @@ pub enum ExprKind {
         name: String,
         args: Vec<Expr>,
     },
+    BuiltinCall {
+        builtin: BuiltinFunction,
+        args: Vec<Expr>,
+    },
     If {
         cond: Box<Expr>,
         then_block: Box<Expr>,
@@ -125,4 +129,83 @@ pub enum TopLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub top_levels: Vec<TopLevel>,
+}
+
+/// 言語組み込み関数
+///
+/// CHIP-8 ハードウェアの機能に直接対応する関数群。
+/// パーサーが関数名から解決し、codegen が各バリアントに対応する命令を生成する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinFunction {
+    /// clear() - 画面クリア (00E0)
+    Clear,
+    /// draw(sprite, x, y) -> bool - スプライト描画 (DXYN)
+    Draw,
+    /// wait_key() -> u8 - キー入力待ち (FX0A)
+    WaitKey,
+    /// is_key_pressed(k: u8) -> bool - キー押下判定 (EX9E)
+    IsKeyPressed,
+    /// delay() -> u8 - ディレイタイマー読み取り (FX07)
+    Delay,
+    /// set_delay(v: u8) - ディレイタイマー設定 (FX15)
+    SetDelay,
+    /// set_sound(v: u8) - サウンドタイマー設定 (FX18)
+    SetSound,
+    /// random(mask: u8) -> u8 - 乱数生成 (CXKK)
+    Random,
+    /// bcd(v: u8) - BCD 変換 (FX33)
+    Bcd,
+    /// draw_digit(v: u8, x: u8, y: u8) - フォント数字描画 (FX29 + DXYN)
+    DrawDigit,
+}
+
+impl BuiltinFunction {
+    /// 関数名から組み込み関数を解決する
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "clear" => Some(Self::Clear),
+            "draw" => Some(Self::Draw),
+            "wait_key" => Some(Self::WaitKey),
+            "is_key_pressed" => Some(Self::IsKeyPressed),
+            "delay" => Some(Self::Delay),
+            "set_delay" => Some(Self::SetDelay),
+            "set_sound" => Some(Self::SetSound),
+            "random" => Some(Self::Random),
+            "bcd" => Some(Self::Bcd),
+            "draw_digit" => Some(Self::DrawDigit),
+            _ => None,
+        }
+    }
+
+    /// 組み込み関数の名前
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Draw => "draw",
+            Self::WaitKey => "wait_key",
+            Self::IsKeyPressed => "is_key_pressed",
+            Self::Delay => "delay",
+            Self::SetDelay => "set_delay",
+            Self::SetSound => "set_sound",
+            Self::Random => "random",
+            Self::Bcd => "bcd",
+            Self::DrawDigit => "draw_digit",
+        }
+    }
+
+    /// この組み込み関数のシグネチャ (引数型リスト, 戻り値型)
+    pub fn signature(self) -> (Vec<Type>, Type) {
+        match self {
+            Self::Clear => (vec![], Type::Unit),
+            Self::Draw => (vec![Type::Sprite(0), Type::U8, Type::U8], Type::Bool),
+            Self::WaitKey => (vec![], Type::U8),
+            Self::IsKeyPressed => (vec![Type::U8], Type::Bool),
+            Self::Delay => (vec![], Type::U8),
+            Self::SetDelay => (vec![Type::U8], Type::Unit),
+            Self::SetSound => (vec![Type::U8], Type::Unit),
+            Self::Random => (vec![Type::U8], Type::U8),
+            Self::Bcd => (vec![Type::U8], Type::Unit),
+            Self::DrawDigit => (vec![Type::U8, Type::U8, Type::U8], Type::Unit),
+        }
+    }
 }

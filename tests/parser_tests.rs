@@ -222,11 +222,11 @@ fn test_function_call() {
             if let ExprKind::Block { stmts, .. } = &body.kind {
                 assert_eq!(stmts.len(), 1);
                 if let StmtKind::Expr(ref expr) = stmts[0].kind {
-                    if let ExprKind::Call { name, args } = &expr.kind {
-                        assert_eq!(name, "draw");
+                    if let ExprKind::BuiltinCall { builtin, args } = &expr.kind {
+                        assert_eq!(*builtin, BuiltinFunction::Draw);
                         assert_eq!(args.len(), 3);
                     } else {
-                        panic!("expected Call");
+                        panic!("expected BuiltinCall");
                     }
                 }
             }
