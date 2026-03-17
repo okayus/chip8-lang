@@ -549,6 +549,39 @@ impl CodeGen {
                 }
             }
             ExprKind::BinaryOp { op, lhs, rhs } => {
+                // struct の等値比較: フィールドごとに比較
+                if matches!(op, BinOp::Eq | BinOp::NotEq) {
+                    let lhs_loc = self.codegen_expr(lhs);
+                    let rhs_loc = self.codegen_expr(rhs);
+                    if let (
+                        ValueLocation::InRegisters(lhs_regs),
+                        ValueLocation::InRegisters(rhs_regs),
+                    ) = (&lhs_loc, &rhs_loc)
+                    {
+                        return self.codegen_struct_equality(lhs_regs, rhs_regs, *op == BinOp::Eq);
+                    }
+                    // struct でない場合、スカラー比較にフォールスルー
+                    let Some(lhs_reg) = lhs_loc.register() else {
+                        return ValueLocation::Void;
+                    };
+                    let Some(rhs_reg) = rhs_loc.register() else {
+                        return ValueLocation::Void;
+                    };
+                    let res = self.alloc_temp_register();
+                    if *op == BinOp::Eq {
+                        self.emit_op(Opcode::LdImm(res.into(), 0));
+                        self.emit_op(Opcode::SeReg(lhs_reg, rhs_reg));
+                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+                        self.emit_op(Opcode::LdImm(res.into(), 1));
+                    } else {
+                        self.emit_op(Opcode::LdImm(res.into(), 0));
+                        self.emit_op(Opcode::SneReg(lhs_reg, rhs_reg));
+                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+                        self.emit_op(Opcode::LdImm(res.into(), 1));
+                    }
+                    return ValueLocation::InRegister(res.into());
+                }
+
                 let Some(lhs_reg) = self.codegen_expr(lhs).register() else {
                     return ValueLocation::Void;
                 };
@@ -564,22 +597,8 @@ impl CodeGen {
                         self.emit_op(Opcode::Sub(lhs_reg, rhs_reg));
                     }
                     BinOp::Mul | BinOp::Div | BinOp::Mod => {}
-                    BinOp::Eq => {
-                        let res = self.alloc_temp_register();
-                        self.emit_op(Opcode::LdImm(res.into(), 0));
-                        self.emit_op(Opcode::SeReg(lhs_reg, rhs_reg));
-                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
-                        self.emit_op(Opcode::LdImm(res.into(), 1));
-                        return ValueLocation::InRegister(res.into());
-                    }
-                    BinOp::NotEq => {
-                        let res = self.alloc_temp_register();
-                        self.emit_op(Opcode::LdImm(res.into(), 0));
-                        self.emit_op(Opcode::SneReg(lhs_reg, rhs_reg));
-                        self.emit_op(Opcode::Jp(self.skip_next_addr()));
-                        self.emit_op(Opcode::LdImm(res.into(), 1));
-                        return ValueLocation::InRegister(res.into());
-                    }
+                    // Eq/NotEq は上で早期リターン済み
+                    BinOp::Eq | BinOp::NotEq => unreachable!(),
                     BinOp::Lt => {
                         let res = self.alloc_temp_register();
                         let tmp = self.alloc_temp_register();
@@ -966,6 +985,49 @@ impl CodeGen {
     }
 
     /// 組み込み関数のコード生成 (exhaustive match で全バリアントをカバー)
+    /// struct の等値比較: フィールドごとに比較し AND (eq) / OR (neq) で集約
+    fn codegen_struct_equality(
+        &mut self,
+        lhs_regs: &[Register],
+        rhs_regs: &[Register],
+        is_eq: bool,
+    ) -> ValueLocation {
+        let res = self.alloc_temp_register();
+
+        if lhs_regs.is_empty() {
+            // 空 struct: 常に等しい
+            self.emit_op(Opcode::LdImm(res.into(), if is_eq { 1 } else { 0 }));
+            return ValueLocation::InRegister(res.into());
+        }
+
+        // 最初のフィールド比較で結果を初期化
+        self.emit_op(Opcode::LdImm(res.into(), 0));
+        self.emit_op(Opcode::SeReg(lhs_regs[0], rhs_regs[0]));
+        self.emit_op(Opcode::Jp(self.skip_next_addr()));
+        self.emit_op(Opcode::LdImm(res.into(), 1));
+        // res = 1 if lhs[0] == rhs[0], 0 otherwise
+
+        // 残りのフィールドについて AND で集約
+        for i in 1..lhs_regs.len().min(rhs_regs.len()) {
+            let tmp = self.alloc_temp_register();
+            self.emit_op(Opcode::LdImm(tmp.into(), 0));
+            self.emit_op(Opcode::SeReg(lhs_regs[i], rhs_regs[i]));
+            self.emit_op(Opcode::Jp(self.skip_next_addr()));
+            self.emit_op(Opcode::LdImm(tmp.into(), 1));
+            // res &= tmp (AND)
+            self.emit_op(Opcode::And(res.into(), tmp.into()));
+        }
+
+        // is_eq=false (NotEq) なら結果を反転: res = res XOR 1
+        if !is_eq {
+            let one = self.alloc_temp_register();
+            self.emit_op(Opcode::LdImm(one.into(), 1));
+            self.emit_op(Opcode::Xor(res.into(), one.into()));
+        }
+
+        ValueLocation::InRegister(res.into())
+    }
+
     fn codegen_builtin_call(&mut self, builtin: BuiltinFunction, args: &[Expr]) -> ValueLocation {
         // draw は args[0] をスプライト名参照として扱い、評価しない
         let is_draw = builtin == BuiltinFunction::Draw;
