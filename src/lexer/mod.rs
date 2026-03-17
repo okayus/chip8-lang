@@ -273,6 +273,8 @@ impl Lexer {
             "return" => TokenKind::Return,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
+            "match" => TokenKind::Match,
+            "enum" => TokenKind::Enum,
             _ => TokenKind::Ident(s),
         };
 
@@ -296,7 +298,14 @@ impl Lexer {
             ']' => TokenKind::RBracket,
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semicolon,
-            ':' => TokenKind::Colon,
+            ':' => {
+                if self.peek() == Some(':') {
+                    self.advance();
+                    TokenKind::ColonColon
+                } else {
+                    TokenKind::Colon
+                }
+            }
             '-' => {
                 if self.peek() == Some('>') {
                     self.advance();
@@ -309,6 +318,9 @@ impl Lexer {
                 if self.peek() == Some('=') {
                     self.advance();
                     TokenKind::EqEq
+                } else if self.peek() == Some('>') {
+                    self.advance();
+                    TokenKind::FatArrow
                 } else {
                     TokenKind::Eq
                 }
@@ -352,6 +364,9 @@ impl Lexer {
                 if self.peek() == Some('|') {
                     self.advance();
                     TokenKind::OrOr
+                } else if self.peek() == Some('>') {
+                    self.advance();
+                    TokenKind::Pipe
                 } else {
                     return Err(LexError {
                         kind: LexErrorKind::UnexpectedCharacter(ch),

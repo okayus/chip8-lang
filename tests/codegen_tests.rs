@@ -203,3 +203,74 @@ fn test_design_doc_program() {
     // JP main
     assert_eq!(bytes[0] & 0xF0, 0x10);
 }
+
+#[test]
+fn test_match_generates_sne_jp() {
+    let bytes = compile(
+        "fn main() -> u8 {
+            let x: u8 = 1;
+            match x {
+                0 => 10,
+                1 => 20,
+                2 => 30,
+            }
+        }",
+    );
+    // match はSNE+JP パターンを生成するはず
+    assert!(bytes.len() > 10);
+    // SNE (4xxx) が含まれること
+    assert!(
+        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x40),
+        "expected SNE instruction in match codegen"
+    );
+}
+
+#[test]
+fn test_enum_variant_generates_ld_imm() {
+    let bytes = compile(
+        "enum Dir { Up, Down, Left }
+         fn main() -> u8 {
+            let d: Dir = Dir::Down;
+            match d {
+                Dir::Up => 0,
+                Dir::Down => 1,
+                Dir::Left => 2,
+            }
+         }",
+    );
+    assert!(bytes.len() > 4);
+}
+
+#[test]
+fn test_function_call_saves_registers() {
+    let bytes = compile(
+        "fn add_one(x: u8) -> u8 {
+            x + 1
+        }
+        fn main() -> u8 {
+            let a: u8 = 5;
+            let b: u8 = add_one(a);
+            a + b
+        }",
+    );
+    // FX55 (LD [I], Vx) と FX65 (LD Vx, [I]) が含まれるはず
+    let has_fx55 = bytes.chunks(2).any(|c| c[1] == 0x55 && c[0] & 0xF0 == 0xF0);
+    let has_fx65 = bytes.chunks(2).any(|c| c[1] == 0x65 && c[0] & 0xF0 == 0xF0);
+    assert!(has_fx55, "expected FX55 (register save) instruction");
+    assert!(has_fx65, "expected FX65 (register restore) instruction");
+}
+
+#[test]
+fn test_pipe_compiles() {
+    let bytes = compile(
+        "fn double(x: u8) -> u8 { x + x }
+         fn main() -> u8 { 5 |> double() }",
+    );
+    // パイプはパース時に脱糖されるので、通常の関数呼び出しと同じバイトコード
+    assert!(bytes.len() > 4);
+    // CALL (2NNN) が含まれること
+    assert!(
+        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x20),
+        "expected CALL instruction"
+    );
+}

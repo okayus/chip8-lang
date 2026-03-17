@@ -72,6 +72,25 @@ pub enum AnalyzeErrorKind {
     BreakOutsideLoop,
     /// 代入の型不一致
     AssignmentTypeMismatch { expected: Type, found: Type },
+    /// match の scrutinee が u8 でも enum でもない
+    MatchScrutineeType(Type),
+    /// match アームのパターンが不正
+    MatchArmPatternNotLiteral,
+    /// match アームの型が不一致
+    MatchArmTypeMismatch { first: Type, found: Type },
+    /// match アームが空
+    MatchNoArms,
+    /// 未定義の enum
+    UndefinedEnum(String),
+    /// 未定義の enum variant
+    UndefinedEnumVariant { enum_name: String, variant: String },
+    /// match の enum 網羅性不足
+    NonExhaustiveMatch {
+        enum_name: String,
+        missing: Vec<String>,
+    },
+    /// 不明な型名
+    UnknownType(String),
 }
 
 /// 意味解析エラー
@@ -162,6 +181,26 @@ impl std::fmt::Display for AnalyzeError {
                     "assignment type mismatch: expected {expected:?}, found {found:?}"
                 )
             }
+            AnalyzeErrorKind::MatchScrutineeType(ty) => {
+                write!(f, "match scrutinee must be u8 or enum, found {ty:?}")
+            }
+            AnalyzeErrorKind::MatchArmPatternNotLiteral => {
+                write!(f, "match arm pattern must be a literal or enum variant")
+            }
+            AnalyzeErrorKind::MatchArmTypeMismatch { first, found } => {
+                write!(f, "match arm type mismatch: {first:?} vs {found:?}")
+            }
+            AnalyzeErrorKind::MatchNoArms => write!(f, "match expression has no arms"),
+            AnalyzeErrorKind::UndefinedEnum(name) => write!(f, "undefined enum: '{name}'"),
+            AnalyzeErrorKind::UndefinedEnumVariant { enum_name, variant } => {
+                write!(f, "undefined variant '{variant}' in enum '{enum_name}'")
+            }
+            AnalyzeErrorKind::NonExhaustiveMatch { enum_name, missing } => write!(
+                f,
+                "non-exhaustive match on '{enum_name}': missing {}",
+                missing.join(", ")
+            ),
+            AnalyzeErrorKind::UnknownType(name) => write!(f, "unknown type: '{name}'"),
         }
     }
 }
@@ -179,6 +218,8 @@ pub struct Analyzer {
     globals: HashMap<String, Type>,
     /// ユーザー定義関数のシグネチャ
     functions: HashMap<String, FnSig>,
+    /// ユーザー定義 enum (名前 → variant リスト)
+    enums: HashMap<String, Vec<String>>,
     /// ローカルスコープスタック
     locals: Vec<HashMap<String, Type>>,
     /// 現在の関数の戻り値型
@@ -194,6 +235,7 @@ impl Analyzer {
         Self {
             globals: HashMap::new(),
             functions: HashMap::new(),
+            enums: HashMap::new(),
             locals: Vec::new(),
             current_return_type: None,
             loop_depth: 0,
@@ -222,6 +264,9 @@ impl Analyzer {
                         },
                     );
                 }
+                TopLevel::EnumDef { name, variants, .. } => {
+                    self.enums.insert(name.clone(), variants.clone());
+                }
             }
         }
 
@@ -230,6 +275,32 @@ impl Analyzer {
             self.errors.push(AnalyzeError {
                 kind: AnalyzeErrorKind::MissingMain,
             });
+        }
+
+        // UserEnum 型の存在チェック
+        for top in &program.top_levels {
+            let types_to_check: Vec<&Type> = match top {
+                TopLevel::FnDef {
+                    params,
+                    return_type,
+                    ..
+                } => {
+                    let mut ts: Vec<&Type> = params.iter().map(|p| &p.ty).collect();
+                    ts.push(return_type);
+                    ts
+                }
+                TopLevel::LetDef { ty, .. } => vec![ty],
+                TopLevel::EnumDef { .. } => vec![],
+            };
+            for ty in types_to_check {
+                if let Type::UserEnum(name) = ty
+                    && !self.enums.contains_key(name)
+                {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::UnknownType(name.clone()),
+                    });
+                }
+            }
         }
 
         // Pass 2: 各定義の本体を解析
@@ -289,6 +360,7 @@ impl Analyzer {
                     self.locals.pop();
                     self.current_return_type = None;
                 }
+                TopLevel::EnumDef { .. } => {}
             }
         }
 
@@ -324,6 +396,7 @@ impl Analyzer {
             }
             (Type::Sprite(_), Type::Sprite(_)) => true,
             (Type::Sprite(n), Type::Array(elem, m)) => *n == *m && **elem == Type::U8,
+            (Type::UserEnum(a), Type::UserEnum(b)) => a == b,
             _ => false,
         }
     }
@@ -528,6 +601,97 @@ impl Analyzer {
                 }
                 first_ty.map(|t| Type::Array(Box::new(t), elems.len()))
             }
+            ExprKind::Match { scrutinee, arms } => {
+                let scr_ty = self.type_check_expr(scrutinee);
+                if let Some(ref st) = scr_ty
+                    && *st != Type::U8
+                    && !matches!(st, Type::UserEnum(_))
+                {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::MatchScrutineeType(st.clone()),
+                    });
+                }
+                if arms.is_empty() {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::MatchNoArms,
+                    });
+                    return None;
+                }
+                // パターンの検証
+                for arm in arms {
+                    match &arm.pattern.kind {
+                        ExprKind::IntLiteral(_) => {}
+                        ExprKind::EnumVariant { .. } => {}
+                        _ => {
+                            self.errors.push(AnalyzeError {
+                                kind: AnalyzeErrorKind::MatchArmPatternNotLiteral,
+                            });
+                        }
+                    }
+                }
+                // enum 網羅性チェック
+                if let Some(Type::UserEnum(ref enum_name)) = scr_ty
+                    && let Some(all_variants) = self.enums.get(enum_name).cloned()
+                {
+                    let covered: Vec<String> = arms
+                        .iter()
+                        .filter_map(|arm| {
+                            if let ExprKind::EnumVariant { variant, .. } = &arm.pattern.kind {
+                                Some(variant.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let missing: Vec<String> = all_variants
+                        .into_iter()
+                        .filter(|v| !covered.contains(v))
+                        .collect();
+                    if !missing.is_empty() {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::NonExhaustiveMatch {
+                                enum_name: enum_name.clone(),
+                                missing,
+                            },
+                        });
+                    }
+                }
+                // 全アームの body 型一致チェック
+                let first_ty = self.type_check_expr(&arms[0].body)?;
+                for arm in &arms[1..] {
+                    if let Some(arm_ty) = self.type_check_expr(&arm.body)
+                        && !Self::types_compatible(&first_ty, &arm_ty)
+                    {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::MatchArmTypeMismatch {
+                                first: first_ty.clone(),
+                                found: arm_ty,
+                            },
+                        });
+                    }
+                }
+                Some(first_ty)
+            }
+            ExprKind::EnumVariant { enum_name, variant } => {
+                if let Some(variants) = self.enums.get(enum_name) {
+                    if !variants.contains(variant) {
+                        self.errors.push(AnalyzeError {
+                            kind: AnalyzeErrorKind::UndefinedEnumVariant {
+                                enum_name: enum_name.clone(),
+                                variant: variant.clone(),
+                            },
+                        });
+                        None
+                    } else {
+                        Some(Type::UserEnum(enum_name.clone()))
+                    }
+                } else {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::UndefinedEnum(enum_name.clone()),
+                    });
+                    None
+                }
+            }
             ExprKind::Index { array, index } => {
                 if let Some(arr_ty) = self.type_check_expr(array) {
                     match arr_ty {
@@ -559,6 +723,13 @@ impl Analyzer {
     fn type_check_stmt(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Let { name, ty, value } => {
+                if let Type::UserEnum(enum_name) = ty
+                    && !self.enums.contains_key(enum_name)
+                {
+                    self.errors.push(AnalyzeError {
+                        kind: AnalyzeErrorKind::UnknownType(enum_name.clone()),
+                    });
+                }
                 if let Some(vt) = self.type_check_expr(value)
                     && !Self::types_compatible(ty, &vt)
                 {

@@ -124,9 +124,10 @@ impl Parser {
         match self.peek() {
             TokenKind::Fn => self.parse_fn_def(),
             TokenKind::Let => self.parse_let_def(),
+            TokenKind::Enum => self.parse_enum_def(),
             _ => Err(ParseError {
                 kind: ParseErrorKind::UnexpectedToken {
-                    expected: "'fn' or 'let'".to_string(),
+                    expected: "'fn', 'let', or 'enum'".to_string(),
                     found: self.peek().clone(),
                 },
                 span: self.current_span(),
@@ -189,6 +190,27 @@ impl Parser {
         })
     }
 
+    fn parse_enum_def(&mut self) -> Result<TopLevel, ParseError> {
+        let span = self.current_span();
+        self.expect(&TokenKind::Enum)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        while self.peek() != &TokenKind::RBrace {
+            let (variant, _) = self.expect_ident()?;
+            variants.push(variant);
+            if self.peek() == &TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(TopLevel::EnumDef {
+            name,
+            variants,
+            span,
+        })
+    }
+
     // ---- 型 ----
 
     fn parse_type(&mut self) -> Result<Type, ParseError> {
@@ -205,10 +227,7 @@ impl Parser {
                         self.expect(&TokenKind::RParen)?;
                         Ok(Type::Sprite(size as usize))
                     }
-                    _ => Err(ParseError {
-                        kind: ParseErrorKind::UnknownType(name),
-                        span,
-                    }),
+                    _ => Ok(Type::UserEnum(name)),
                 }
             }
             TokenKind::LParen => {
@@ -327,6 +346,13 @@ impl Parser {
         let mut lhs = self.parse_unary()?;
 
         loop {
+            // パイプ演算子: 最低優先度、左結合
+            if self.peek() == &TokenKind::Pipe && min_bp == 0 {
+                self.advance();
+                lhs = self.parse_pipe_rhs(lhs)?;
+                continue;
+            }
+
             let op = match self.peek() {
                 TokenKind::Plus => BinOp::Add,
                 TokenKind::Minus => BinOp::Sub,
@@ -442,6 +468,18 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // enum variant: Name::Variant
+                if self.peek() == &TokenKind::ColonColon {
+                    self.advance();
+                    let (variant, _) = self.expect_ident()?;
+                    return Ok(Expr {
+                        kind: ExprKind::EnumVariant {
+                            enum_name: name,
+                            variant,
+                        },
+                        span,
+                    });
+                }
                 // 関数呼び出し
                 if self.peek() == &TokenKind::LParen {
                     self.advance();
@@ -496,6 +534,7 @@ impl Parser {
             }
             TokenKind::LBrace => Ok(self.parse_block_expr()?),
             TokenKind::If => self.parse_if_expr(),
+            TokenKind::Match => self.parse_match_expr(),
             TokenKind::Loop => self.parse_loop_expr(),
             _ => Err(ParseError {
                 kind: ParseErrorKind::UnexpectedToken {
@@ -614,6 +653,57 @@ impl Parser {
             },
             span,
         })
+    }
+
+    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+        let span = self.current_span();
+        self.expect(&TokenKind::Match)?;
+        let scrutinee = self.parse_expr()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut arms = Vec::new();
+        while self.peek() != &TokenKind::RBrace {
+            let pattern = self.parse_primary()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = self.parse_expr()?;
+            arms.push(MatchArm { pattern, body });
+            if self.peek() == &TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(Expr {
+            kind: ExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms,
+            },
+            span,
+        })
+    }
+
+    fn parse_pipe_rhs(&mut self, piped: Expr) -> Result<Expr, ParseError> {
+        let span = piped.span;
+        let (name, _) = self.expect_ident()?;
+        let mut args = vec![piped];
+        if self.peek() == &TokenKind::LParen {
+            self.advance();
+            if self.peek() != &TokenKind::RParen {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if self.peek() == &TokenKind::Comma {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+        }
+        let kind = if let Some(builtin) = BuiltinFunction::from_name(&name) {
+            ExprKind::BuiltinCall { builtin, args }
+        } else {
+            ExprKind::Call { name, args }
+        };
+        Ok(Expr { kind, span })
     }
 
     fn parse_loop_expr(&mut self) -> Result<Expr, ParseError> {

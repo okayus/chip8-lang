@@ -1,7 +1,7 @@
 use chip8_lang::analyzer::{AnalyzeError, AnalyzeErrorKind, Analyzer};
 use chip8_lang::lexer::Lexer;
 use chip8_lang::parser::Parser;
-use chip8_lang::parser::ast::BuiltinFunction;
+use chip8_lang::parser::ast::{BuiltinFunction, Type};
 
 fn analyze(input: &str) -> Result<(), Vec<AnalyzeError>> {
     let mut lexer = Lexer::new(input);
@@ -329,4 +329,137 @@ fn test_max_locals_ok() {
         params.join(", ")
     );
     analyze_ok(&input);
+}
+
+#[test]
+fn test_match_u8() {
+    analyze_ok(
+        "fn main() -> u8 {
+            let x: u8 = 1;
+            match x {
+                0 => 10,
+                1 => 20,
+                2 => 30,
+            }
+        }",
+    );
+}
+
+#[test]
+fn test_match_scrutinee_not_u8_or_enum() {
+    analyze_err_kind(
+        "fn main() -> u8 {
+            let x: bool = true;
+            match x {
+                0 => 10,
+                1 => 20,
+            }
+        }",
+        AnalyzeErrorKind::MatchScrutineeType(Type::Bool),
+    );
+}
+
+#[test]
+fn test_match_arm_type_mismatch() {
+    analyze_err_kind(
+        "fn main() -> u8 {
+            let x: u8 = 1;
+            match x {
+                0 => 10,
+                1 => true,
+            }
+        }",
+        AnalyzeErrorKind::MatchArmTypeMismatch {
+            first: Type::U8,
+            found: Type::Bool,
+        },
+    );
+}
+
+#[test]
+fn test_match_no_arms() {
+    analyze_err_kind(
+        "fn main() -> () {
+            let x: u8 = 1;
+            match x {};
+        }",
+        AnalyzeErrorKind::MatchNoArms,
+    );
+}
+
+#[test]
+fn test_enum_definition_and_use() {
+    analyze_ok(
+        "enum Dir { Up, Down, Left, Right }
+         fn main() -> Dir {
+            Dir::Up
+         }",
+    );
+}
+
+#[test]
+fn test_enum_undefined_variant() {
+    analyze_err_kind(
+        "enum Dir { Up, Down }
+         fn main() -> Dir {
+            Dir::Left
+         }",
+        AnalyzeErrorKind::UndefinedEnumVariant {
+            enum_name: "Dir".to_string(),
+            variant: "Left".to_string(),
+        },
+    );
+}
+
+#[test]
+fn test_enum_undefined_enum() {
+    analyze_err_kind(
+        "fn main() -> () {
+            let x: u8 = 0;
+            Foo::Bar;
+         }",
+        AnalyzeErrorKind::UndefinedEnum("Foo".to_string()),
+    );
+}
+
+#[test]
+fn test_match_enum_exhaustive() {
+    analyze_ok(
+        "enum Dir { Up, Down }
+         fn main() -> u8 {
+            let d: Dir = Dir::Up;
+            match d {
+                Dir::Up => 1,
+                Dir::Down => 2,
+            }
+         }",
+    );
+}
+
+#[test]
+fn test_match_enum_non_exhaustive() {
+    analyze_err_kind(
+        "enum Dir { Up, Down, Left }
+         fn main() -> u8 {
+            let d: Dir = Dir::Up;
+            match d {
+                Dir::Up => 1,
+                Dir::Down => 2,
+            }
+         }",
+        AnalyzeErrorKind::NonExhaustiveMatch {
+            enum_name: "Dir".to_string(),
+            missing: vec!["Left".to_string()],
+        },
+    );
+}
+
+#[test]
+fn test_unknown_type() {
+    analyze_err_kind(
+        "fn main() -> () {
+            let x: Foo = 0;
+         }",
+        AnalyzeErrorKind::UnknownType("Foo".to_string()),
+    );
 }

@@ -18,6 +18,8 @@ pub enum TokenKind {
     Return,
     True,
     False,
+    Match,
+    Enum,
 
     // リテラル
     IntLiteral(u64),
@@ -52,7 +54,10 @@ pub enum TokenKind {
     Comma,
     Semicolon,
     Colon,
-    Arrow, // ->
+    Arrow,      // ->
+    FatArrow,   // =>
+    ColonColon, // ::
+    Pipe,       // |>
 
     // 特殊
     Eof,

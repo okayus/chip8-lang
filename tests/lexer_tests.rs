@@ -289,3 +289,24 @@ fn main() -> () {
     // 十分な数のトークンが生成されていること
     assert!(tokens.len() > 50);
 }
+
+#[test]
+fn test_match_and_fat_arrow() {
+    let ks = kinds("match x { 0 => 1, }");
+    assert!(ks.contains(&TokenKind::Match));
+    assert!(ks.contains(&TokenKind::FatArrow));
+}
+
+#[test]
+fn test_enum_and_colon_colon() {
+    let ks = kinds("enum Piece { I, O }");
+    assert!(ks.contains(&TokenKind::Enum));
+    let ks2 = kinds("Piece::I");
+    assert!(ks2.contains(&TokenKind::ColonColon));
+}
+
+#[test]
+fn test_pipe_operator() {
+    let ks = kinds("x |> f()");
+    assert!(ks.contains(&TokenKind::Pipe));
+}

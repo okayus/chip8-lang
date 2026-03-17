@@ -59,6 +59,10 @@ pub struct CodeGen {
     resolved_addrs: HashMap<String, Addr>,
     /// グローバル変数のスプライトサイズ (バイト数)
     sprite_sizes: HashMap<String, usize>,
+    /// enum variant → u8 値
+    enum_variant_values: HashMap<(String, String), u8>,
+    /// レジスタ退避用の次のスロットアドレス
+    next_save_slot: u16,
     /// ローカル変数名 → 割り当て済みレジスタ
     local_bindings: HashMap<String, UserRegister>,
     /// 次に割り当て可能なレジスタ番号
@@ -80,6 +84,8 @@ impl CodeGen {
             data_offsets: HashMap::new(),
             resolved_addrs: HashMap::new(),
             sprite_sizes: HashMap::new(),
+            enum_variant_values: HashMap::new(),
+            next_save_slot: 0x0A0,
             local_bindings: HashMap::new(),
             next_free_reg: 0,
             local_var_count: 0,
@@ -90,6 +96,16 @@ impl CodeGen {
 
     /// プログラム全体をコード生成し、バイトコードを返す
     pub fn generate(&mut self, program: &Program) -> Vec<u8> {
+        // Pass 0: enum 定義を登録
+        for top in &program.top_levels {
+            if let TopLevel::EnumDef { name, variants, .. } = top {
+                for (i, variant) in variants.iter().enumerate() {
+                    self.enum_variant_values
+                        .insert((name.clone(), variant.clone()), i as u8);
+                }
+            }
+        }
+
         // Pass 1: グローバル定数・スプライトをデータとして記録
         for top in &program.top_levels {
             if let TopLevel::LetDef {
@@ -258,6 +274,18 @@ impl CodeGen {
         }
     }
 
+    fn pattern_value(&self, pattern: &Expr) -> u8 {
+        match &pattern.kind {
+            ExprKind::IntLiteral(v) => *v as u8,
+            ExprKind::EnumVariant { enum_name, variant } => self
+                .enum_variant_values
+                .get(&(enum_name.clone(), variant.clone()))
+                .copied()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     // ---- コード生成 ----
 
     fn codegen_expr(&mut self, expr: &Expr) -> ValueLocation {
@@ -403,18 +431,45 @@ impl CodeGen {
                         arg_regs.push(reg);
                     }
                 }
+                let num_to_save = self.local_var_count;
+
+                // caller-save: ローカル変数をメモリに退避
+                let save_addr = self.next_save_slot;
+                if num_to_save > 0 {
+                    self.emit_op(Opcode::LdI(Addr::new(save_addr)));
+                    let last_reg = UserRegister::new(num_to_save - 1);
+                    self.emit_op(Opcode::LdIVx(last_reg.into()));
+                    self.next_save_slot += num_to_save as u16;
+                }
+
+                // 引数を V0, V1, ... にコピー
                 for (i, &arg_reg) in arg_regs.iter().enumerate() {
                     let target: Register = UserRegister::new(i as u8).into();
                     if arg_reg != target {
                         self.emit_op(Opcode::LdReg(target, arg_reg));
                     }
                 }
+
+                // CALL
                 let offset = self.emit_placeholder();
                 self.forward_refs.push(ForwardRef {
                     offset,
                     kind: ForwardRefKind::Call(name.clone()),
                 });
-                ValueLocation::InRegister(Register::V0)
+
+                // 戻り値を退避してからレジスタを復帰
+                let result_reg = if num_to_save > 0 {
+                    let temp = UserRegister::new(num_to_save);
+                    self.emit_op(Opcode::LdReg(temp.into(), Register::V0));
+                    self.emit_op(Opcode::LdI(Addr::new(save_addr)));
+                    let last_reg = UserRegister::new(num_to_save - 1);
+                    self.emit_op(Opcode::LdVxI(last_reg.into()));
+                    temp.into()
+                } else {
+                    Register::V0
+                };
+
+                ValueLocation::InRegister(result_reg)
             }
             ExprKind::If {
                 cond,
@@ -479,6 +534,49 @@ impl CodeGen {
                 } else {
                     ValueLocation::Void
                 }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                let Some(scr_reg) = self.codegen_expr(scrutinee).register() else {
+                    return ValueLocation::Void;
+                };
+                if arms.is_empty() {
+                    return ValueLocation::Void;
+                }
+                if arms.len() == 1 {
+                    return self.codegen_expr(&arms[0].body);
+                }
+                let mut end_offsets = Vec::new();
+                let last_idx = arms.len() - 1;
+                for (i, arm) in arms.iter().enumerate() {
+                    if i == last_idx {
+                        // 最終アーム: デフォルト (条件なし)
+                        let loc = self.codegen_expr(&arm.body);
+                        let end_addr = self.current_addr();
+                        for off in &end_offsets {
+                            self.patch_at(*off, Opcode::Jp(end_addr));
+                        }
+                        return loc;
+                    }
+                    let pattern_val = self.pattern_value(&arm.pattern);
+                    self.emit_op(Opcode::SneImm(scr_reg, pattern_val));
+                    let jp_next_arm = self.emit_placeholder();
+                    self.codegen_expr(&arm.body);
+                    let jp_end = self.emit_placeholder();
+                    end_offsets.push(jp_end);
+                    let next_addr = self.current_addr();
+                    self.patch_at(jp_next_arm, Opcode::Jp(next_addr));
+                }
+                ValueLocation::Void
+            }
+            ExprKind::EnumVariant { enum_name, variant } => {
+                let val = self
+                    .enum_variant_values
+                    .get(&(enum_name.clone(), variant.clone()))
+                    .copied()
+                    .unwrap_or(0);
+                let reg = self.alloc_temp_register();
+                self.emit_op(Opcode::LdImm(reg.into(), val));
+                ValueLocation::InRegister(reg.into())
             }
             ExprKind::ArrayLiteral(_) => ValueLocation::Void,
             ExprKind::Index { array, index } => {

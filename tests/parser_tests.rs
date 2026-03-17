@@ -374,3 +374,157 @@ fn test_parse_error() {
     let mut parser = Parser::new(tokens);
     assert!(parser.parse_program().is_err());
 }
+
+#[test]
+fn test_match_expr() {
+    let prog = parse(
+        "fn main() -> u8 {
+            match x {
+                0 => 10,
+                1 => 20,
+                2 => 30,
+            }
+        }",
+    );
+    match &prog.top_levels[0] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                if let ExprKind::Match { arms, .. } = &tail.kind {
+                    assert_eq!(arms.len(), 3);
+                    assert!(matches!(arms[0].pattern.kind, ExprKind::IntLiteral(0)));
+                    assert!(matches!(arms[1].pattern.kind, ExprKind::IntLiteral(1)));
+                } else {
+                    panic!("expected Match");
+                }
+            } else {
+                panic!("expected Block");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
+fn test_enum_def() {
+    let prog = parse("enum Color { Red, Green, Blue } fn main() -> () { }");
+    match &prog.top_levels[0] {
+        TopLevel::EnumDef { name, variants, .. } => {
+            assert_eq!(name, "Color");
+            assert_eq!(variants, &["Red", "Green", "Blue"]);
+        }
+        _ => panic!("expected EnumDef"),
+    }
+}
+
+#[test]
+fn test_enum_variant_expr() {
+    let prog = parse(
+        "enum Dir { Up, Down }
+         fn main() -> Dir { Dir::Up }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                assert!(matches!(
+                    &tail.kind,
+                    ExprKind::EnumVariant {
+                        enum_name,
+                        variant,
+                    } if enum_name == "Dir" && variant == "Up"
+                ));
+            } else {
+                panic!("expected Block with tail");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
+fn test_pipe_desugars_to_call() {
+    let prog = parse(
+        "fn f(x: u8) -> u8 { x }
+         fn main() -> u8 { 5 |> f() }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                if let ExprKind::Call { name, args } = &tail.kind {
+                    assert_eq!(name, "f");
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(args[0].kind, ExprKind::IntLiteral(5)));
+                } else {
+                    panic!("expected Call, got {:?}", tail.kind);
+                }
+            } else {
+                panic!("expected Block");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
+fn test_pipe_with_extra_args() {
+    let prog = parse(
+        "fn clamp(x: u8, lo: u8, hi: u8) -> u8 { x }
+         fn main() -> u8 { 5 |> clamp(0, 10) }",
+    );
+    match &prog.top_levels[1] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                if let ExprKind::Call { name, args } = &tail.kind {
+                    assert_eq!(name, "clamp");
+                    assert_eq!(args.len(), 3);
+                } else {
+                    panic!("expected Call");
+                }
+            } else {
+                panic!("expected Block");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
+
+#[test]
+fn test_pipe_chain() {
+    // a |> f() |> g() => g(f(a))
+    let prog = parse(
+        "fn f(x: u8) -> u8 { x }
+         fn g(x: u8) -> u8 { x }
+         fn main() -> u8 { 1 |> f() |> g() }",
+    );
+    match &prog.top_levels[2] {
+        TopLevel::FnDef { body, .. } => {
+            if let ExprKind::Block {
+                expr: Some(tail), ..
+            } = &body.kind
+            {
+                if let ExprKind::Call { name, args } = &tail.kind {
+                    assert_eq!(name, "g");
+                    assert_eq!(args.len(), 1);
+                    // The inner arg should be f(1)
+                    assert!(matches!(&args[0].kind, ExprKind::Call { name, .. } if name == "f"));
+                } else {
+                    panic!("expected Call to g");
+                }
+            } else {
+                panic!("expected Block");
+            }
+        }
+        _ => panic!("expected FnDef"),
+    }
+}
