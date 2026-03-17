@@ -213,7 +213,7 @@ fn test_design_doc_program() {
 }
 
 #[test]
-fn test_match_generates_sne_jp() {
+fn test_match_generates_se_jp() {
     let bytes = compile(
         "fn main() -> u8 {
             let x: u8 = 1;
@@ -224,12 +224,12 @@ fn test_match_generates_sne_jp() {
             }
         }",
     );
-    // match はSNE+JP パターンを生成するはず
+    // match はSE+JP パターンを生成するはず
     assert!(bytes.len() > 10);
-    // SNE (4xxx) が含まれること
+    // SE (3xxx) が含まれること
     assert!(
-        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x40),
-        "expected SNE instruction in match codegen"
+        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x30),
+        "expected SE instruction in match codegen"
     );
 }
 
