@@ -636,6 +636,73 @@ impl CodeGen {
         }
     }
 
+    /// match の arm パターンが 0 始まりの連続整数かどうかを判定
+    fn can_use_jump_table(&self, arms: &[MatchArm]) -> bool {
+        if arms.len() < 2 {
+            return false;
+        }
+        let mut values: Vec<u8> = arms
+            .iter()
+            .map(|arm| self.pattern_value(&arm.pattern))
+            .collect();
+        values.sort();
+        values.iter().enumerate().all(|(i, &v)| v == i as u8)
+    }
+
+    /// ジャンプテーブルを使った match コード生成
+    fn codegen_match_jump_table(&mut self, scr_reg: Register, arms: &[MatchArm]) -> ValueLocation {
+        // arm をパターン値でソート (ジャンプテーブルのインデックス順)
+        let mut sorted_arms: Vec<(u8, &MatchArm)> = arms
+            .iter()
+            .map(|arm| (self.pattern_value(&arm.pattern), arm))
+            .collect();
+        sorted_arms.sort_by_key(|(val, _)| *val);
+
+        // scrutinee を V0 にコピー (V0 でなければ)
+        if scr_reg != Register::V0 {
+            self.emit_op(Opcode::LdReg(Register::V0, scr_reg));
+        }
+        // V0 *= 2 (各ジャンプテーブルエントリ = 1 JP = 2 bytes)
+        self.emit_op(Opcode::Add(Register::V0, Register::V0));
+        // JpV0(table_base): table_base は次の命令のアドレス
+        let table_base = Addr::new(self.current_addr().raw() + INSTRUCTION_SIZE);
+        self.emit_op(Opcode::JpV0(table_base));
+
+        // ジャンプテーブル: 各 arm への JP placeholder
+        let table_placeholders: Vec<ByteOffset> = (0..sorted_arms.len())
+            .map(|_| self.emit_placeholder())
+            .collect();
+
+        // 各 arm の body を生成
+        let mut end_offsets = Vec::new();
+        let last_idx = sorted_arms.len() - 1;
+        let mut result_loc = ValueLocation::Void;
+
+        for (i, (_, arm)) in sorted_arms.iter().enumerate() {
+            // ジャンプテーブルエントリをパッチ
+            let arm_addr = self.current_addr();
+            self.patch_at(table_placeholders[i], Opcode::Jp(arm_addr));
+
+            // arm body を生成
+            let loc = self.codegen_expr(&arm.body);
+
+            if i == last_idx {
+                // 最終 arm: end ジャンプ不要
+                result_loc = loc;
+                let end_addr = self.current_addr();
+                for off in &end_offsets {
+                    self.patch_at(*off, Opcode::Jp(end_addr));
+                }
+            } else {
+                // 中間 arm: end へのジャンプ
+                let jp_end = self.emit_placeholder();
+                end_offsets.push(jp_end);
+            }
+        }
+
+        result_loc
+    }
+
     // ---- コールグラフ解析 ----
 
     /// AST を走査して関数ごとのメタデータを構築する
@@ -705,8 +772,23 @@ impl CodeGen {
         let Some(meta) = self.fn_meta.get(name) else {
             return false;
         };
-        // リーフ関数 && 小さな本体 && 自己再帰なし
-        meta.is_leaf && meta.body_node_count <= 15 && !meta.callees.contains(name)
+        // 自己再帰なし && 小さな本体
+        // リーフ関数 or callee が 1 つだけの非リーフ関数をインライン対象にする
+        !meta.callees.contains(name)
+            && meta.body_node_count <= 30
+            && (meta.is_leaf || meta.callees.len() == 1)
+    }
+
+    /// 現在のレジスタ使用状況でインライン展開が安全かを判定
+    fn can_inline_here(&self, name: &str) -> bool {
+        if !self.should_inline(name) {
+            return false;
+        }
+        let Some(meta) = self.fn_meta.get(name) else {
+            return false;
+        };
+        // caller の next_free_reg + callee の estimated_max_reg が V14 以内か
+        self.next_free_reg + meta.estimated_max_reg <= 15
     }
 
     /// 式中のユーザー定義関数呼び出しを再帰的に収集
@@ -1560,7 +1642,7 @@ impl CodeGen {
                 }
             }
             ExprKind::BuiltinCall { builtin, args } => self.codegen_builtin_call(*builtin, args),
-            ExprKind::Call { name, args } if self.should_inline(name) => {
+            ExprKind::Call { name, args } if self.can_inline_here(name) => {
                 self.codegen_inline_call(name, args)
             }
             ExprKind::Call { name, args } => {
@@ -1824,6 +1906,11 @@ impl CodeGen {
                 if arms.len() == 1 {
                     return self.codegen_expr(&arms[0].body);
                 }
+                // ジャンプテーブル最適化: 連続整数パターンなら O(1) ジャンプ
+                if self.can_use_jump_table(arms) {
+                    return self.codegen_match_jump_table(scr_reg, arms);
+                }
+                // フォールバック: SE+JP 線形探索
                 let mut end_offsets = Vec::new();
                 let last_idx = arms.len() - 1;
                 for (i, arm) in arms.iter().enumerate() {
