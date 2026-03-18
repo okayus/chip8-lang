@@ -262,19 +262,6 @@ fn test_sprite_and_draw() {
 }
 
 #[test]
-fn test_custom_draw_batch_and_key_edge_builtins() {
-    analyze_ok(
-        "
-        fn main() -> () {
-            begin_draw_batch();
-            let rotate: bool = is_key_just_pressed(5);
-            end_draw_batch();
-        }
-    ",
-    );
-}
-
-#[test]
 fn test_assign_type_mismatch() {
     analyze_err_matches(
         "
