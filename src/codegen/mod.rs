@@ -1190,6 +1190,11 @@ impl CodeGen {
                 self.emit_op(Opcode::SneImm(cond_reg, 0x00));
                 let jp_else_offset = self.emit_placeholder();
 
+                // then/else ブランチ間でレジスタを再利用するため、
+                // then ブランチ前の状態を保存し、else 開始前に復元する
+                let saved_local_var_count = self.local_var_count;
+                let saved_next_free_reg = self.next_free_reg;
+
                 let then_loc = self.codegen_expr_tail(then_block);
 
                 if let Some(else_block) = else_block {
@@ -1225,6 +1230,10 @@ impl CodeGen {
 
                     let else_addr = self.current_addr();
                     self.patch_at(jp_else_offset, Opcode::Jp(else_addr));
+
+                    // else ブランチでは then のレジスタ状態をリセット
+                    self.local_var_count = saved_local_var_count;
+                    self.next_free_reg = saved_next_free_reg;
 
                     let else_loc = self.codegen_expr_tail(else_block);
 
@@ -1690,6 +1699,10 @@ impl CodeGen {
                 self.emit_op(Opcode::SneImm(cond_reg, 0x00));
                 let jp_else_offset = self.emit_placeholder();
 
+                // then/else ブランチ間でレジスタを再利用するため保存
+                let saved_local_var_count = self.local_var_count;
+                let saved_next_free_reg = self.next_free_reg;
+
                 let then_loc = self.codegen_expr(then_block);
 
                 if let Some(else_block) = else_block {
@@ -1724,6 +1737,10 @@ impl CodeGen {
 
                     let else_addr = self.current_addr();
                     self.patch_at(jp_else_offset, Opcode::Jp(else_addr));
+
+                    // else ブランチでは then のレジスタ状態をリセット
+                    self.local_var_count = saved_local_var_count;
+                    self.next_free_reg = saved_next_free_reg;
 
                     let else_loc = self.codegen_expr(else_block);
 

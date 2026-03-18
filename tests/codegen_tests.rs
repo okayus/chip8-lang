@@ -1485,3 +1485,57 @@ fn test_small_struct_still_uses_registers() {
     let call_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x20).count();
     assert_eq!(call_count, 0, "small struct function should be inlined");
 }
+
+#[test]
+fn test_if_else_branch_register_reuse() {
+    // if-else ブランチ間でレジスタが再利用され、オーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "struct GameState { piece: u8, px: u8, py: u8, score: u8, speed: u8, level: u8 }
+             fn process(gs: GameState) -> u8 {
+                if gs.score > 0 {
+                    let a: u8 = gs.piece;
+                    let b: u8 = gs.px;
+                    let c: u8 = gs.py;
+                    let d: u8 = gs.score;
+                    a + b + c + d
+                } else {
+                    let e: u8 = gs.speed;
+                    let f: u8 = gs.level;
+                    e + f
+                }
+             }
+             fn main() -> u8 {
+                process(GameState { piece: 1, px: 2, py: 3, score: 4, speed: 5, level: 6 })
+             }"
+        ),
+        10 // 1 + 2 + 3 + 4
+    );
+}
+
+#[test]
+fn test_nested_if_else_no_overflow() {
+    // ネストした if-else でもレジスタが累積せずオーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "fn choose(a: u8, b: u8, c: u8) -> u8 {
+                if a > 0 {
+                    let x: u8 = a + 1;
+                    let y: u8 = b + 1;
+                    if x > 5 {
+                        let z: u8 = x + y;
+                        z
+                    } else {
+                        let w: u8 = x + c;
+                        w
+                    }
+                } else {
+                    let v: u8 = b + c;
+                    v
+                }
+             }
+             fn main() -> u8 { choose(3, 4, 5) }"
+        ),
+        9 // a=3 > 0 → x=4, y=5. x=4 > 5? No → w = x+c = 4+5 = 9
+    );
+}
