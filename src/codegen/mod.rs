@@ -259,7 +259,7 @@ impl CodeGen {
 
                 // レジスタに余裕がある場合のみ StructInRegisters を使用
                 // (パラメータ + let 束縛 + テンプで V14 を超えないようにする)
-                const MAX_PARAM_REGS_FOR_REGISTER_MODE: u8 = 8;
+                const MAX_PARAM_REGS_FOR_REGISTER_MODE: u8 = 4;
                 let use_register_mode =
                     !has_struct_param || total_flat_params <= MAX_PARAM_REGS_FOR_REGISTER_MODE;
 
@@ -1184,16 +1184,15 @@ impl CodeGen {
                 then_block,
                 else_block,
             } => {
+                // 条件式テンプ割り当て前に保存 (テンプをブランチで再利用可能にする)
+                let saved_local_var_count = self.local_var_count;
+                let saved_next_free_reg = self.next_free_reg;
+
                 let Some(cond_reg) = self.codegen_expr(cond).register() else {
                     return ValueLocation::Void;
                 };
                 self.emit_op(Opcode::SneImm(cond_reg, 0x00));
                 let jp_else_offset = self.emit_placeholder();
-
-                // then/else ブランチ間でレジスタを再利用するため、
-                // then ブランチ前の状態を保存し、else 開始前に復元する
-                let saved_local_var_count = self.local_var_count;
-                let saved_next_free_reg = self.next_free_reg;
 
                 let then_loc = self.codegen_expr_tail(then_block);
 
@@ -1693,15 +1692,15 @@ impl CodeGen {
                 then_block,
                 else_block,
             } => {
+                // 条件式テンプ割り当て前に保存 (テンプをブランチで再利用可能にする)
+                let saved_local_var_count = self.local_var_count;
+                let saved_next_free_reg = self.next_free_reg;
+
                 let Some(cond_reg) = self.codegen_expr(cond).register() else {
                     return ValueLocation::Void;
                 };
                 self.emit_op(Opcode::SneImm(cond_reg, 0x00));
                 let jp_else_offset = self.emit_placeholder();
-
-                // then/else ブランチ間でレジスタを再利用するため保存
-                let saved_local_var_count = self.local_var_count;
-                let saved_next_free_reg = self.next_free_reg;
 
                 let then_loc = self.codegen_expr(then_block);
 
