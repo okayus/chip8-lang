@@ -120,15 +120,32 @@ fn test_loop_generates_jp() {
 
 #[test]
 fn test_function_call_generates_call() {
+    // 非リーフ関数は CALL を生成する (インライン展開されない)
     let bytes = compile(
-        "fn helper() -> () { clear(); }
-         fn main() -> () { helper(); }",
+        "fn identity(x: u8) -> u8 { x }
+         fn helper(x: u8) -> u8 { identity(x) + 1 }
+         fn main() -> u8 { helper(5) }",
     );
     // CALL (2NNN) が含まれる
     let has_call = bytes
         .chunks(2)
         .any(|w| w.len() == 2 && (w[0] & 0xF0) == 0x20);
     assert!(has_call, "expected CALL instruction, got: {:02X?}", bytes);
+}
+
+#[test]
+fn test_small_leaf_function_is_inlined() {
+    // 小さなリーフ関数は CALL ではなくインライン展開される
+    let bytes = compile(
+        "fn add_one(x: u8) -> u8 { x + 1 }
+         fn main() -> u8 { add_one(5) }",
+    );
+    // CALL (2NNN) が含まれない (インライン展開されたため)
+    let has_call = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x20);
+    assert!(
+        !has_call,
+        "expected no CALL instruction (function should be inlined)"
+    );
 }
 
 #[test]
@@ -266,11 +283,11 @@ fn test_enum_variant_generates_ld_imm() {
 
 #[test]
 fn test_function_call_saves_registers() {
+    // 非リーフ関数呼び出しでは caller-save が発生する
     let bytes = compile(
-        "fn add_one(x: u8) -> u8 {
-            x + 1
-        }
-        fn main() -> u8 {
+        "fn identity(x: u8) -> u8 { x }
+         fn add_one(x: u8) -> u8 { identity(x) + 1 }
+         fn main() -> u8 {
             let a: u8 = 5;
             let b: u8 = add_one(a);
             a + b
@@ -285,17 +302,13 @@ fn test_function_call_saves_registers() {
 
 #[test]
 fn test_pipe_compiles() {
-    let bytes = compile(
+    // パイプは脱糖されるので通常の関数呼び出しと同じ
+    // double はリーフ・小関数なのでインライン展開される
+    let result = compile_and_run(
         "fn double(x: u8) -> u8 { x + x }
          fn main() -> u8 { 5 |> double() }",
     );
-    // パイプはパース時に脱糖されるので、通常の関数呼び出しと同じバイトコード
-    assert!(bytes.len() > 4);
-    // CALL (2NNN) が含まれること
-    assert!(
-        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x20),
-        "expected CALL instruction"
-    );
+    assert_eq!(result, 10);
 }
 
 #[test]
@@ -442,8 +455,9 @@ fn test_struct_equality_compiles() {
 
 #[test]
 fn test_struct_param_memory_backed() {
-    // struct パラメータをメモリ経由で受け渡しできること
-    let bytes = compile(
+    // struct パラメータを持つ関数が正しくコンパイル・実行されること
+    // get_x は小さなリーフ関数なのでインライン展開される
+    let result = compile_and_run(
         "struct Pos { x: u8, y: u8 }
          fn get_x(p: Pos) -> u8 { p.x }
          fn main() -> u8 {
@@ -451,16 +465,13 @@ fn test_struct_param_memory_backed() {
             get_x(p)
          }",
     );
-    assert!(bytes.len() >= 4);
-    // CALL 命令が含まれること
-    let has_call = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x20);
-    assert!(has_call, "expected CALL instruction");
+    assert_eq!(result, 5);
 }
 
 #[test]
 fn test_multiple_struct_params_no_overflow() {
     // 複数の struct 引数でもレジスタオーバーフローしないこと
-    let bytes = compile(
+    let result = compile_and_run(
         "struct Pos { x: u8, y: u8 }
          fn add_pos(a: Pos, b: Pos) -> u8 {
             a.x + b.x
@@ -471,9 +482,7 @@ fn test_multiple_struct_params_no_overflow() {
             add_pos(p1, p2)
          }",
     );
-    assert!(bytes.len() >= 4);
-    let has_call = bytes.chunks(2).any(|c| (c[0] & 0xF0) == 0x20);
-    assert!(has_call, "expected CALL instruction");
+    assert_eq!(result, 4);
 }
 
 #[test]
@@ -1235,5 +1244,104 @@ fn test_non_leaf_still_saves_all() {
              }"
         ),
         41 // 10 + 20 + 11 = 41
+    );
+}
+
+// ---- issue #56: 関数インライン展開 ----
+
+#[test]
+fn test_inline_no_call_instruction() {
+    // インライン化された関数は CALL も RET も生成しない
+    let bytes = compile(
+        "fn add_one(x: u8) -> u8 { x + 1 }
+         fn main() -> u8 {
+            let a: u8 = add_one(5);
+            let b: u8 = add_one(10);
+            a + b
+         }",
+    );
+    let call_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x20).count();
+    assert_eq!(call_count, 0, "inlined functions should not generate CALL");
+}
+
+#[test]
+fn test_inline_correctness_simple() {
+    assert_eq!(
+        compile_and_run(
+            "fn inc(x: u8) -> u8 { x + 1 }
+             fn main() -> u8 { inc(41) }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_inline_correctness_with_locals() {
+    // caller にローカル変数がある状態でインライン展開が正しく動くこと
+    assert_eq!(
+        compile_and_run(
+            "fn add(x: u8, y: u8) -> u8 { x + y }
+             fn main() -> u8 {
+                let a: u8 = 10;
+                let b: u8 = 20;
+                let c: u8 = add(a, b);
+                c + 5
+             }"
+        ),
+        35 // 10 + 20 + 5
+    );
+}
+
+#[test]
+fn test_inline_struct_param() {
+    // struct パラメータを持つリーフ関数のインライン展開
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn sum_pos(p: Pos) -> u8 { p.x + p.y }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 15, y: 25 };
+                sum_pos(p)
+             }"
+        ),
+        40
+    );
+}
+
+#[test]
+fn test_inline_multiple_calls_preserve_locals() {
+    // 複数回のインライン呼び出しで caller の変数が壊れないこと
+    assert_eq!(
+        compile_and_run(
+            "fn double(x: u8) -> u8 { x + x }
+             fn main() -> u8 {
+                let a: u8 = 3;
+                let b: u8 = double(a);
+                let c: u8 = double(b);
+                a + c
+             }"
+        ),
+        15 // 3 + (3*2*2) = 3 + 12 = 15
+    );
+}
+
+#[test]
+fn test_inline_reduces_rom_size() {
+    // インライン展開により ROM サイズが CALL 版より小さくなること
+    let inlined_bytes = compile(
+        "fn add_one(x: u8) -> u8 { x + 1 }
+         fn main() -> u8 { add_one(5) }",
+    );
+    // 比較用: 非リーフ関数を挟んでインライン展開を防ぐ
+    let call_bytes = compile(
+        "fn identity(x: u8) -> u8 { x }
+         fn add_one(x: u8) -> u8 { identity(x) + 1 }
+         fn main() -> u8 { add_one(5) }",
+    );
+    assert!(
+        inlined_bytes.len() < call_bytes.len(),
+        "inlined ROM ({} bytes) should be smaller than CALL ROM ({} bytes)",
+        inlined_bytes.len(),
+        call_bytes.len()
     );
 }
