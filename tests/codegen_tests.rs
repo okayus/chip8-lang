@@ -1345,3 +1345,197 @@ fn test_inline_reduces_rom_size() {
         call_bytes.len()
     );
 }
+
+// ---- issue #56: struct レジスタ保持 ----
+
+#[test]
+fn test_struct_in_registers_field_access() {
+    // struct パラメータがレジスタに保持されフィールドアクセスが正しいこと
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn get_y(p: Pos) -> u8 { p.y }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 10, y: 42 };
+                get_y(p)
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_struct_param_register_reduces_size() {
+    // struct パラメータのレジスタ保持により ROM サイズが削減されること
+    // (struct パラメータの save/restore が不要になる)
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn sum_pos(p: Pos) -> u8 { p.x + p.y }
+         fn main() -> u8 { sum_pos(Pos { x: 3, y: 7 }) }",
+    );
+    // sum_pos はインライン展開されるため、コンパクトなバイトコードになる
+    // (パラメータのメモリ退避+再ロードが不要)
+    // struct リテラルはまだメモリ経由だが、フィールドアクセスは最適化済み
+    assert!(
+        bytes.len() <= 70,
+        "struct register optimization should produce compact code, got {} bytes",
+        bytes.len()
+    );
+}
+
+#[test]
+fn test_struct_in_registers_mixed_params() {
+    // struct + scalar 混合パラメータが正しく動作すること
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn offset(p: Pos, dx: u8) -> u8 { p.x + dx }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 10, y: 20 };
+                offset(p, 5)
+             }"
+        ),
+        15
+    );
+}
+
+#[test]
+fn test_struct_let_binding_registers() {
+    // let で struct をバインドした後のフィールドアクセスが正しいこと
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 30, y: 12 };
+                p.x + p.y
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_struct_register_field_access_non_leaf() {
+    // 非リーフ関数で struct パラメータがレジスタに保持され
+    // フィールドアクセスが正しく動作すること
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn id(x: u8) -> u8 { x }
+             fn sum_pos(p: Pos) -> u8 {
+                let a: u8 = id(p.x);
+                a + p.y
+             }
+             fn main() -> u8 {
+                sum_pos(Pos { x: 10, y: 20 })
+             }"
+        ),
+        30
+    );
+}
+
+// ---- issue #61: 大きな struct のレジスタオーバーフロー修正 ----
+
+#[test]
+fn test_large_struct_param_no_overflow() {
+    // 6フィールドの struct パラメータでレジスタオーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "struct GameState { piece: u8, px: u8, py: u8, score: u8, speed: u8, level: u8 }
+             fn get_score(gs: GameState) -> u8 { gs.score }
+             fn main() -> u8 {
+                let gs: GameState = GameState { piece: 1, px: 10, py: 5, score: 42, speed: 3, level: 2 };
+                get_score(gs)
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_large_struct_with_locals_no_overflow() {
+    // 大きな struct パラメータ + 複数の let 束縛でオーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "struct GameState { piece: u8, px: u8, py: u8, score: u8, speed: u8, level: u8 }
+             fn process(gs: GameState) -> u8 {
+                let p: u8 = gs.piece;
+                let x: u8 = gs.px;
+                let y: u8 = gs.py;
+                let s: u8 = gs.score;
+                p + x + y + s
+             }
+             fn main() -> u8 {
+                process(GameState { piece: 1, px: 2, py: 3, score: 4, speed: 5, level: 6 })
+             }"
+        ),
+        10 // 1 + 2 + 3 + 4
+    );
+}
+
+#[test]
+fn test_small_struct_still_uses_registers() {
+    // 小さな struct (2フィールド) は引き続きレジスタ保持されること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn sum_pos(p: Pos) -> u8 { p.x + p.y }
+         fn main() -> u8 { sum_pos(Pos { x: 3, y: 7 }) }",
+    );
+    // sum_pos はインライン化されるため CALL なし
+    let call_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x20).count();
+    assert_eq!(call_count, 0, "small struct function should be inlined");
+}
+
+#[test]
+fn test_if_else_branch_register_reuse() {
+    // if-else ブランチ間でレジスタが再利用され、オーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "struct GameState { piece: u8, px: u8, py: u8, score: u8, speed: u8, level: u8 }
+             fn process(gs: GameState) -> u8 {
+                if gs.score > 0 {
+                    let a: u8 = gs.piece;
+                    let b: u8 = gs.px;
+                    let c: u8 = gs.py;
+                    let d: u8 = gs.score;
+                    a + b + c + d
+                } else {
+                    let e: u8 = gs.speed;
+                    let f: u8 = gs.level;
+                    e + f
+                }
+             }
+             fn main() -> u8 {
+                process(GameState { piece: 1, px: 2, py: 3, score: 4, speed: 5, level: 6 })
+             }"
+        ),
+        10 // 1 + 2 + 3 + 4
+    );
+}
+
+#[test]
+fn test_nested_if_else_no_overflow() {
+    // ネストした if-else でもレジスタが累積せずオーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "fn choose(a: u8, b: u8, c: u8) -> u8 {
+                if a > 0 {
+                    let x: u8 = a + 1;
+                    let y: u8 = b + 1;
+                    if x > 5 {
+                        let z: u8 = x + y;
+                        z
+                    } else {
+                        let w: u8 = x + c;
+                        w
+                    }
+                } else {
+                    let v: u8 = b + c;
+                    v
+                }
+             }
+             fn main() -> u8 { choose(3, 4, 5) }"
+        ),
+        9 // a=3 > 0 → x=4, y=5. x=4 > 5? No → w = x+c = 4+5 = 9
+    );
+}
