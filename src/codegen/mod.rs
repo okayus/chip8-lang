@@ -237,27 +237,86 @@ impl CodeGen {
                 self.next_free_reg = 0;
                 self.local_var_count = 0;
 
-                // パラメータを直接レジスタにバインド
-                // (struct パラメータも連続レジスタに保持し、メモリ経由を省略)
-                for param in params {
-                    if let Type::UserType(ref type_name) = param.ty
-                        && self.struct_defs.contains_key(type_name)
-                    {
-                        let count = self.struct_field_count(type_name) as u8;
-                        let base_reg = UserRegister::new(self.next_free_reg);
-                        self.next_free_reg += count;
-                        self.local_bindings.insert(
-                            param.name.clone(),
-                            LocalBinding::StructInRegisters {
-                                struct_name: type_name.clone(),
-                                base_reg,
-                                field_count: count,
-                            },
-                        );
+                // パラメータのフラット合計レジスタ数を計算
+                let has_struct_param = params.iter().any(|p| {
+                    if let Type::UserType(ref tn) = p.ty {
+                        self.struct_defs.contains_key(tn)
                     } else {
-                        let reg = self.alloc_register();
-                        self.local_bindings
-                            .insert(param.name.clone(), LocalBinding::Single(reg));
+                        false
+                    }
+                });
+                let total_flat_params: u8 = params
+                    .iter()
+                    .map(|p| {
+                        if let Type::UserType(ref tn) = p.ty
+                            && self.struct_defs.contains_key(tn)
+                        {
+                            return self.struct_field_count(tn) as u8;
+                        }
+                        1
+                    })
+                    .sum();
+
+                // レジスタに余裕がある場合のみ StructInRegisters を使用
+                // (パラメータ + let 束縛 + テンプで V14 を超えないようにする)
+                const MAX_PARAM_REGS_FOR_REGISTER_MODE: u8 = 8;
+                let use_register_mode =
+                    !has_struct_param || total_flat_params <= MAX_PARAM_REGS_FOR_REGISTER_MODE;
+
+                if use_register_mode {
+                    // レジスタモード: struct パラメータも連続レジスタに直接保持
+                    for param in params {
+                        if let Type::UserType(ref type_name) = param.ty
+                            && self.struct_defs.contains_key(type_name)
+                        {
+                            let count = self.struct_field_count(type_name) as u8;
+                            let base_reg = UserRegister::new(self.next_free_reg);
+                            self.next_free_reg += count;
+                            self.local_bindings.insert(
+                                param.name.clone(),
+                                LocalBinding::StructInRegisters {
+                                    struct_name: type_name.clone(),
+                                    base_reg,
+                                    field_count: count,
+                                },
+                            );
+                        } else {
+                            let reg = self.alloc_register();
+                            self.local_bindings
+                                .insert(param.name.clone(), LocalBinding::Single(reg));
+                        }
+                    }
+                } else {
+                    // メモリモード: レジスタ圧力が高い場合のフォールバック
+                    let params_mem_base = self.alloc_mem_slot(total_flat_params as u16);
+
+                    if total_flat_params > 0 {
+                        self.emit_op(Opcode::LdI(Addr::new(params_mem_base)));
+                        let last_reg = UserRegister::new(total_flat_params - 1);
+                        self.emit_op(Opcode::LdIVx(last_reg.into()));
+                    }
+
+                    let mut mem_offset = 0u16;
+                    for param in params {
+                        if let Type::UserType(ref type_name) = param.ty
+                            && self.struct_defs.contains_key(type_name)
+                        {
+                            let count = self.struct_field_count(type_name) as u16;
+                            self.local_bindings.insert(
+                                param.name.clone(),
+                                LocalBinding::StructInMemory {
+                                    addr: params_mem_base + mem_offset,
+                                    struct_name: type_name.clone(),
+                                },
+                            );
+                            mem_offset += count;
+                        } else {
+                            let reg = self.alloc_register();
+                            self.emit_load_from_memory(reg.into(), params_mem_base + mem_offset);
+                            self.local_bindings
+                                .insert(param.name.clone(), LocalBinding::Single(reg));
+                            mem_offset += 1;
+                        }
                     }
                 }
                 self.local_var_count = self.next_free_reg;

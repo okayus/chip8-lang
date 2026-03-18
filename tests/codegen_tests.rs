@@ -1433,3 +1433,55 @@ fn test_struct_register_field_access_non_leaf() {
         30
     );
 }
+
+// ---- issue #61: 大きな struct のレジスタオーバーフロー修正 ----
+
+#[test]
+fn test_large_struct_param_no_overflow() {
+    // 6フィールドの struct パラメータでレジスタオーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "struct GameState { piece: u8, px: u8, py: u8, score: u8, speed: u8, level: u8 }
+             fn get_score(gs: GameState) -> u8 { gs.score }
+             fn main() -> u8 {
+                let gs: GameState = GameState { piece: 1, px: 10, py: 5, score: 42, speed: 3, level: 2 };
+                get_score(gs)
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_large_struct_with_locals_no_overflow() {
+    // 大きな struct パラメータ + 複数の let 束縛でオーバーフローしないこと
+    assert_eq!(
+        compile_and_run(
+            "struct GameState { piece: u8, px: u8, py: u8, score: u8, speed: u8, level: u8 }
+             fn process(gs: GameState) -> u8 {
+                let p: u8 = gs.piece;
+                let x: u8 = gs.px;
+                let y: u8 = gs.py;
+                let s: u8 = gs.score;
+                p + x + y + s
+             }
+             fn main() -> u8 {
+                process(GameState { piece: 1, px: 2, py: 3, score: 4, speed: 5, level: 6 })
+             }"
+        ),
+        10 // 1 + 2 + 3 + 4
+    );
+}
+
+#[test]
+fn test_small_struct_still_uses_registers() {
+    // 小さな struct (2フィールド) は引き続きレジスタ保持されること
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn sum_pos(p: Pos) -> u8 { p.x + p.y }
+         fn main() -> u8 { sum_pos(Pos { x: 3, y: 7 }) }",
+    );
+    // sum_pos はインライン化されるため CALL なし
+    let call_count = bytes.chunks(2).filter(|c| (c[0] & 0xF0) == 0x20).count();
+    assert_eq!(call_count, 0, "small struct function should be inlined");
+}
