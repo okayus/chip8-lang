@@ -139,6 +139,29 @@ fn test_sprite_and_draw() {
 }
 
 #[test]
+fn test_custom_batch_and_key_edge_codegen() {
+    let bytes = compile(
+        "fn main() -> () {
+            begin_draw_batch();
+            let rotate: bool = is_key_just_pressed(5);
+            end_draw_batch();
+        }",
+    );
+    assert!(
+        bytes.chunks(2).any(|w| w == [0x00, 0xF0]),
+        "expected custom begin draw batch opcode"
+    );
+    assert!(
+        bytes.chunks(2).any(|w| w == [0xE0, 0x9F] || (w[0] & 0xF0) == 0xE0 && w[1] == 0x9F),
+        "expected custom just-pressed opcode"
+    );
+    assert!(
+        bytes.chunks(2).any(|w| w == [0x00, 0xF1]),
+        "expected custom end draw batch opcode"
+    );
+}
+
+#[test]
 fn test_if_generates_skip_and_jp() {
     let bytes = compile(
         "fn main() -> () {
