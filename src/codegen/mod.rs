@@ -54,6 +54,21 @@ enum LocalBinding {
     StructInMemory { addr: u16, struct_name: String },
 }
 
+/// 関数ごとの最適化メタデータ (コールグラフ解析で構築)
+#[derive(Debug, Clone)]
+struct FunctionMeta {
+    /// 呼び出すユーザー定義関数のリスト (インライン展開判定で使用予定)
+    #[allow(dead_code)]
+    callees: HashSet<String>,
+    /// 他のユーザー定義関数を呼ばない (callees が空)
+    is_leaf: bool,
+    /// パラメータのフラット化レジスタ数 (インライン展開判定で使用予定)
+    #[allow(dead_code)]
+    flat_param_count: u8,
+    /// 推定最大レジスタ使用数 (caller-save 最適化用)
+    estimated_max_reg: u8,
+}
+
 /// コード生成器
 ///
 /// AST を走査して CHIP-8 バイトコードを生成する。
@@ -79,6 +94,8 @@ pub struct CodeGen {
     struct_defs: HashMap<String, Vec<StructField>>,
     /// 関数の戻り値型 (struct 戻り値のメモリ化に使用)
     fn_return_types: HashMap<String, Type>,
+    /// 関数ごとの最適化メタデータ (コールグラフ解析結果)
+    fn_meta: HashMap<String, FunctionMeta>,
     /// メモリスロット割り当て用の次のアドレス (struct データ + caller-save 共用)
     next_save_slot: u16,
     /// ローカル変数名 → 割り当て済みバインディング
@@ -112,6 +129,7 @@ impl CodeGen {
             mutable_globals: HashSet::new(),
             struct_defs: HashMap::new(),
             fn_return_types: HashMap::new(),
+            fn_meta: HashMap::new(),
             next_save_slot: 0x0A0,
             local_bindings: HashMap::new(),
             next_free_reg: 0,
@@ -141,6 +159,9 @@ impl CodeGen {
                 _ => {}
             }
         }
+
+        // コールグラフ解析: 関数ごとのメタデータを構築
+        self.analyze_call_graph(program);
 
         // Pass 1: グローバル定数・スプライトをデータとして記録
         for top in &program.top_levels {
@@ -567,6 +588,290 @@ impl CodeGen {
         }
     }
 
+    // ---- コールグラフ解析 ----
+
+    /// AST を走査して関数ごとのメタデータを構築する
+    fn analyze_call_graph(&mut self, program: &Program) {
+        // 全関数名を収集 (ユーザー定義関数の判定用)
+        let fn_names: HashSet<String> = program
+            .top_levels
+            .iter()
+            .filter_map(|top| {
+                if let TopLevel::FnDef { name, .. } = top {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for top in &program.top_levels {
+            if let TopLevel::FnDef {
+                name, params, body, ..
+            } = top
+            {
+                let mut callees = HashSet::new();
+                Self::collect_callees(body, &fn_names, &mut callees);
+
+                let flat_param_count: u8 = params
+                    .iter()
+                    .map(|p| {
+                        if let Type::UserType(ref tn) = p.ty
+                            && let Some(fields) = self.struct_defs.get(tn)
+                        {
+                            return fields.len() as u8;
+                        }
+                        1
+                    })
+                    .sum();
+
+                let let_count = Self::count_let_bindings(body);
+                let expr_temps = Self::estimate_expr_temps(body);
+                // 関数が使うレジスタ: パラメータ + let束縛 + 式評価テンポラリ
+                let estimated_max_reg = (flat_param_count + let_count + expr_temps).min(15);
+
+                let is_leaf = callees.is_empty();
+                self.fn_meta.insert(
+                    name.clone(),
+                    FunctionMeta {
+                        callees,
+                        is_leaf,
+                        flat_param_count,
+                        estimated_max_reg,
+                    },
+                );
+            }
+        }
+    }
+
+    /// 式中のユーザー定義関数呼び出しを再帰的に収集
+    fn collect_callees(expr: &Expr, fn_names: &HashSet<String>, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Call { name, args } => {
+                if fn_names.contains(name) {
+                    out.insert(name.clone());
+                }
+                for arg in args {
+                    Self::collect_callees(arg, fn_names, out);
+                }
+            }
+            ExprKind::BuiltinCall { args, .. } => {
+                for arg in args {
+                    Self::collect_callees(arg, fn_names, out);
+                }
+            }
+            ExprKind::BinaryOp { lhs, rhs, .. } => {
+                Self::collect_callees(lhs, fn_names, out);
+                Self::collect_callees(rhs, fn_names, out);
+            }
+            ExprKind::UnaryOp { expr, .. } => {
+                Self::collect_callees(expr, fn_names, out);
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                Self::collect_callees(cond, fn_names, out);
+                Self::collect_callees(then_block, fn_names, out);
+                if let Some(e) = else_block {
+                    Self::collect_callees(e, fn_names, out);
+                }
+            }
+            ExprKind::Loop { body } => {
+                Self::collect_callees(body, fn_names, out);
+            }
+            ExprKind::Block { stmts, expr } => {
+                for stmt in stmts {
+                    Self::collect_callees_stmt(stmt, fn_names, out);
+                }
+                if let Some(e) = expr {
+                    Self::collect_callees(e, fn_names, out);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                Self::collect_callees(scrutinee, fn_names, out);
+                for arm in arms {
+                    Self::collect_callees(&arm.body, fn_names, out);
+                }
+            }
+            ExprKind::StructLiteral { fields, base, .. } => {
+                for (_, expr) in fields {
+                    Self::collect_callees(expr, fn_names, out);
+                }
+                if let Some(b) = base {
+                    Self::collect_callees(b, fn_names, out);
+                }
+            }
+            ExprKind::FieldAccess { expr, .. } => {
+                Self::collect_callees(expr, fn_names, out);
+            }
+            ExprKind::Index { array, index } => {
+                Self::collect_callees(array, fn_names, out);
+                Self::collect_callees(index, fn_names, out);
+            }
+            ExprKind::ArrayLiteral(elems) => {
+                for elem in elems {
+                    Self::collect_callees(elem, fn_names, out);
+                }
+            }
+            ExprKind::IntLiteral(_)
+            | ExprKind::BoolLiteral(_)
+            | ExprKind::Ident(_)
+            | ExprKind::EnumVariant { .. } => {}
+        }
+    }
+
+    /// 文中のユーザー定義関数呼び出しを再帰的に収集
+    fn collect_callees_stmt(stmt: &Stmt, fn_names: &HashSet<String>, out: &mut HashSet<String>) {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } => Self::collect_callees(value, fn_names, out),
+            StmtKind::Assign { value, .. } => Self::collect_callees(value, fn_names, out),
+            StmtKind::IndexAssign { index, value, .. } => {
+                Self::collect_callees(index, fn_names, out);
+                Self::collect_callees(value, fn_names, out);
+            }
+            StmtKind::Expr(expr) => Self::collect_callees(expr, fn_names, out),
+            StmtKind::Return(Some(expr)) => Self::collect_callees(expr, fn_names, out),
+            StmtKind::Return(None) | StmtKind::Break => {}
+        }
+    }
+
+    /// 式中の let 束縛の数を数える
+    fn count_let_bindings(expr: &Expr) -> u8 {
+        match &expr.kind {
+            ExprKind::Block { stmts, expr } => {
+                let mut count: u8 = 0;
+                for stmt in stmts {
+                    if matches!(stmt.kind, StmtKind::Let { .. }) {
+                        count = count.saturating_add(1);
+                    }
+                    count = count.saturating_add(Self::count_let_bindings_stmt(stmt));
+                }
+                if let Some(e) = expr {
+                    count = count.saturating_add(Self::count_let_bindings(e));
+                }
+                count
+            }
+            ExprKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                let a = Self::count_let_bindings(then_block);
+                let b = else_block
+                    .as_ref()
+                    .map(|e| Self::count_let_bindings(e))
+                    .unwrap_or(0);
+                a.max(b)
+            }
+            ExprKind::Loop { body } => Self::count_let_bindings(body),
+            ExprKind::Match { arms, .. } => arms
+                .iter()
+                .map(|arm| Self::count_let_bindings(&arm.body))
+                .max()
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn count_let_bindings_stmt(stmt: &Stmt) -> u8 {
+        match &stmt.kind {
+            StmtKind::Expr(expr) => Self::count_let_bindings(expr),
+            _ => 0,
+        }
+    }
+
+    /// 式の評価中に割り当てられるテンポラリレジスタ数を推定
+    /// (codegen の alloc_temp_register 呼び出し回数の上界)
+    fn estimate_expr_temps(expr: &Expr) -> u8 {
+        match &expr.kind {
+            ExprKind::IntLiteral(_) | ExprKind::BoolLiteral(_) | ExprKind::EnumVariant { .. } => 1,
+            ExprKind::Ident(_) => 0,
+            ExprKind::BinaryOp { op, lhs, rhs } => {
+                let base =
+                    Self::estimate_expr_temps(lhs).saturating_add(Self::estimate_expr_temps(rhs));
+                let extra = match op {
+                    BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or => 0,
+                    BinOp::Mul | BinOp::Div => 3,
+                    BinOp::Mod => 1,
+                    BinOp::Eq | BinOp::NotEq => 1,
+                    BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => 2,
+                };
+                base.saturating_add(extra)
+            }
+            ExprKind::UnaryOp { expr, .. } => Self::estimate_expr_temps(expr).saturating_add(1),
+            ExprKind::Call { args, .. } | ExprKind::BuiltinCall { args, .. } => {
+                let arg_temps: u8 = args.iter().map(Self::estimate_expr_temps).sum();
+                arg_temps.saturating_add(1)
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let c = Self::estimate_expr_temps(cond);
+                let t = Self::estimate_expr_temps(then_block);
+                let e = else_block
+                    .as_ref()
+                    .map(|e| Self::estimate_expr_temps(e))
+                    .unwrap_or(0);
+                c.max(t).max(e)
+            }
+            ExprKind::Block { stmts, expr } => {
+                let stmt_max = stmts
+                    .iter()
+                    .map(Self::estimate_stmt_temps)
+                    .max()
+                    .unwrap_or(0);
+                let expr_max = expr
+                    .as_ref()
+                    .map(|e| Self::estimate_expr_temps(e))
+                    .unwrap_or(0);
+                stmt_max.max(expr_max)
+            }
+            ExprKind::Loop { body } => Self::estimate_expr_temps(body),
+            ExprKind::Match { scrutinee, arms } => {
+                let s = Self::estimate_expr_temps(scrutinee);
+                let arm_max = arms
+                    .iter()
+                    .map(|a| Self::estimate_expr_temps(&a.body))
+                    .max()
+                    .unwrap_or(0);
+                s.max(arm_max)
+            }
+            ExprKind::StructLiteral { fields, base, .. } => {
+                let f: u8 = fields
+                    .iter()
+                    .map(|(_, e)| Self::estimate_expr_temps(e))
+                    .sum();
+                let b = base
+                    .as_ref()
+                    .map(|e| Self::estimate_expr_temps(e))
+                    .unwrap_or(0);
+                f.max(b)
+            }
+            ExprKind::FieldAccess { expr, .. } => Self::estimate_expr_temps(expr),
+            ExprKind::Index { array, index } => {
+                Self::estimate_expr_temps(array).saturating_add(Self::estimate_expr_temps(index))
+            }
+            ExprKind::ArrayLiteral(elems) => elems.iter().map(Self::estimate_expr_temps).sum(),
+        }
+    }
+
+    fn estimate_stmt_temps(stmt: &Stmt) -> u8 {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } => Self::estimate_expr_temps(value),
+            StmtKind::Assign { value, .. } => Self::estimate_expr_temps(value),
+            StmtKind::IndexAssign { index, value, .. } => {
+                Self::estimate_expr_temps(index).saturating_add(Self::estimate_expr_temps(value))
+            }
+            StmtKind::Expr(expr) => Self::estimate_expr_temps(expr),
+            StmtKind::Return(Some(expr)) => Self::estimate_expr_temps(expr),
+            StmtKind::Return(None) | StmtKind::Break => 0,
+        }
+    }
+
     // ---- コード生成 ----
 
     /// 末尾位置の式をコード生成 (TCO 対象の自己再帰を検出)
@@ -954,10 +1259,18 @@ impl CodeGen {
                         }
                     }
                 }
-                // caller-save: 全ライブレジスタをメモリに退避
-                // local_var_count ではなく next_free_reg を使い、
-                // 一時レジスタ (前の関数呼び出しの戻り値等) も保護する
-                let num_to_save = self.next_free_reg;
+                // caller-save: ライブレジスタをメモリに退避
+                // リーフ関数の場合、callee の推定最大レジスタ使用数に制限して
+                // 退避レジスタ数を削減する (callee が触らないレジスタは保護不要)
+                let num_to_save = if let Some(meta) = self.fn_meta.get(name) {
+                    if meta.is_leaf {
+                        self.next_free_reg.min(meta.estimated_max_reg)
+                    } else {
+                        self.next_free_reg
+                    }
+                } else {
+                    self.next_free_reg
+                };
 
                 let save_addr = self.next_save_slot;
                 if num_to_save > 0 {

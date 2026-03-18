@@ -1114,3 +1114,126 @@ fn test_run_issue46_nested_struct_piece_preserved() {
         42
     );
 }
+
+// ---- issue #56: リーフ関数 caller-save 最適化 ----
+
+#[test]
+fn test_leaf_function_fewer_saves() {
+    // リーフ関数呼び出しでは caller-save が最適化され、
+    // 非リーフ関数より少ない FX55/FX65 が生成されること
+    let leaf_bytes = compile(
+        "fn add_one(x: u8) -> u8 { x + 1 }
+         fn main() -> u8 {
+            let a: u8 = 1;
+            let b: u8 = 2;
+            let c: u8 = 3;
+            let d: u8 = 4;
+            let e: u8 = 5;
+            add_one(a) + b + c + d + e
+         }",
+    );
+    let non_leaf_bytes = compile(
+        "fn identity(x: u8) -> u8 { x }
+         fn add_one(x: u8) -> u8 { identity(x) + 1 }
+         fn main() -> u8 {
+            let a: u8 = 1;
+            let b: u8 = 2;
+            let c: u8 = 3;
+            let d: u8 = 4;
+            let e: u8 = 5;
+            add_one(a) + b + c + d + e
+         }",
+    );
+
+    // FX55 (レジスタ退避) の最大レジスタ番号を比較
+    // リーフ呼び出しでは退避範囲が小さいはず
+    let leaf_max_save = leaf_bytes
+        .chunks(2)
+        .filter(|c| c[1] == 0x55 && c[0] & 0xF0 == 0xF0)
+        .map(|c| c[0] & 0x0F)
+        .max()
+        .unwrap_or(0);
+    let non_leaf_max_save = non_leaf_bytes
+        .chunks(2)
+        .filter(|c| c[1] == 0x55 && c[0] & 0xF0 == 0xF0)
+        .map(|c| c[0] & 0x0F)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        leaf_max_save < non_leaf_max_save,
+        "leaf caller-save should use fewer registers: leaf={}, non_leaf={}",
+        leaf_max_save,
+        non_leaf_max_save
+    );
+}
+
+#[test]
+fn test_leaf_optimization_correctness() {
+    // リーフ関数最適化で計算結果が正しいことを検証
+    assert_eq!(
+        compile_and_run(
+            "fn add_one(x: u8) -> u8 { x + 1 }
+             fn main() -> u8 {
+                let a: u8 = 10;
+                let b: u8 = 20;
+                let c: u8 = add_one(a);
+                a + b + c
+             }"
+        ),
+        41 // 10 + 20 + 11 = 41
+    );
+}
+
+#[test]
+fn test_leaf_optimization_multiple_calls() {
+    // 複数のリーフ関数呼び出しで各変数が保護されること
+    assert_eq!(
+        compile_and_run(
+            "fn double(x: u8) -> u8 { x + x }
+             fn main() -> u8 {
+                let a: u8 = 3;
+                let b: u8 = 5;
+                let c: u8 = double(a);
+                let d: u8 = double(b);
+                c + d
+             }"
+        ),
+        16 // 6 + 10 = 16
+    );
+}
+
+#[test]
+fn test_leaf_optimization_with_struct_param() {
+    // struct パラメータを持つリーフ関数でも正しく動作すること
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn sum_pos(p: Pos) -> u8 { p.x + p.y }
+             fn main() -> u8 {
+                let a: u8 = 100;
+                let p: Pos = Pos { x: 10, y: 20 };
+                let s: u8 = sum_pos(p);
+                s + a
+             }"
+        ),
+        130 // 30 + 100 = 130
+    );
+}
+
+#[test]
+fn test_non_leaf_still_saves_all() {
+    // 非リーフ関数呼び出しでは全レジスタが退避されること
+    assert_eq!(
+        compile_and_run(
+            "fn identity(x: u8) -> u8 { x }
+             fn add_via_identity(x: u8) -> u8 { identity(x) + 1 }
+             fn main() -> u8 {
+                let a: u8 = 10;
+                let b: u8 = 20;
+                let c: u8 = add_via_identity(a);
+                a + b + c
+             }"
+        ),
+        41 // 10 + 20 + 11 = 41
+    );
+}
