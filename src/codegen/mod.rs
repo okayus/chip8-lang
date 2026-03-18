@@ -779,6 +779,18 @@ impl CodeGen {
             && (meta.is_leaf || meta.callees.len() == 1)
     }
 
+    /// 現在のレジスタ使用状況でインライン展開が安全かを判定
+    fn can_inline_here(&self, name: &str) -> bool {
+        if !self.should_inline(name) {
+            return false;
+        }
+        let Some(meta) = self.fn_meta.get(name) else {
+            return false;
+        };
+        // caller の next_free_reg + callee の estimated_max_reg が V14 以内か
+        self.next_free_reg + meta.estimated_max_reg <= 15
+    }
+
     /// 式中のユーザー定義関数呼び出しを再帰的に収集
     fn collect_callees(expr: &Expr, fn_names: &HashSet<String>, out: &mut HashSet<String>) {
         match &expr.kind {
@@ -1630,7 +1642,7 @@ impl CodeGen {
                 }
             }
             ExprKind::BuiltinCall { builtin, args } => self.codegen_builtin_call(*builtin, args),
-            ExprKind::Call { name, args } if self.should_inline(name) => {
+            ExprKind::Call { name, args } if self.can_inline_here(name) => {
                 self.codegen_inline_call(name, args)
             }
             ExprKind::Call { name, args } => {

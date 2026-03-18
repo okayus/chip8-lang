@@ -293,7 +293,6 @@ fn test_match_non_consecutive_generates_se_jp() {
         bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x30),
         "expected SE instruction in match codegen (fallback)"
     );
-    // ジャンプテーブルは使われない
     assert!(
         !bytes.chunks(2).any(|c| c[0] & 0xF0 == 0xB0),
         "should not use JpV0 for non-consecutive patterns"
