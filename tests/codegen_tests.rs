@@ -22,13 +22,28 @@ fn compile_and_run(input: &str) -> u8 {
 #[test]
 fn test_empty_main() {
     let bytes = compile("fn main() -> () { }");
-    // JP main (1NNN) + main body (RET = 00EE)
+    // JP main (1NNN) + main body (JP self = halt)
     assert!(bytes.len() >= 4);
     // 最初の命令は JP (1xxx)
     assert_eq!(bytes[0] & 0xF0, 0x10);
-    // main の RET (00EE)
-    assert!(bytes.contains(&0x00));
-    assert!(bytes.contains(&0xEE));
+    // main の末尾はセルフループ (JP to self) で停止
+    let last_two = &bytes[bytes.len() - 2..];
+    assert_eq!(
+        last_two[0] & 0xF0,
+        0x10,
+        "expected JP instruction at end of main"
+    );
+    // ジャンプ先アドレスが命令自体のアドレスと一致する
+    let jump_target = ((last_two[0] as u16 & 0x0F) << 8) | last_two[1] as u16;
+    let instruction_addr = 0x200 + (bytes.len() as u16 - 2);
+    assert_eq!(jump_target, instruction_addr, "expected self-loop halt");
+}
+
+#[test]
+fn test_main_halts_without_stack_underflow() {
+    // main が値を返す有限プログラムがセルフループで正常停止する
+    let result = compile_and_run("fn main() -> u8 { 42 }");
+    assert_eq!(result, 42);
 }
 
 #[test]
