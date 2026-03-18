@@ -57,16 +57,17 @@ enum LocalBinding {
 /// 関数ごとの最適化メタデータ (コールグラフ解析で構築)
 #[derive(Debug, Clone)]
 struct FunctionMeta {
-    /// 呼び出すユーザー定義関数のリスト (インライン展開判定で使用予定)
-    #[allow(dead_code)]
+    /// 呼び出すユーザー定義関数のリスト
     callees: HashSet<String>,
     /// 他のユーザー定義関数を呼ばない (callees が空)
     is_leaf: bool,
-    /// パラメータのフラット化レジスタ数 (インライン展開判定で使用予定)
+    /// パラメータのフラット化レジスタ数 (struct レジスタ保持最適化で使用予定)
     #[allow(dead_code)]
     flat_param_count: u8,
     /// 推定最大レジスタ使用数 (caller-save 最適化用)
     estimated_max_reg: u8,
+    /// AST ノード数 (インライン展開判定用)
+    body_node_count: usize,
 }
 
 /// コード生成器
@@ -96,6 +97,8 @@ pub struct CodeGen {
     fn_return_types: HashMap<String, Type>,
     /// 関数ごとの最適化メタデータ (コールグラフ解析結果)
     fn_meta: HashMap<String, FunctionMeta>,
+    /// 関数の AST 本体 (インライン展開用)
+    fn_bodies: HashMap<String, (Vec<Param>, Expr)>,
     /// メモリスロット割り当て用の次のアドレス (struct データ + caller-save 共用)
     next_save_slot: u16,
     /// ローカル変数名 → 割り当て済みバインディング
@@ -130,6 +133,7 @@ impl CodeGen {
             struct_defs: HashMap::new(),
             fn_return_types: HashMap::new(),
             fn_meta: HashMap::new(),
+            fn_bodies: HashMap::new(),
             next_save_slot: 0x0A0,
             local_bindings: HashMap::new(),
             next_free_reg: 0,
@@ -630,6 +634,7 @@ impl CodeGen {
                 // 関数が使うレジスタ: パラメータ + let束縛 + 式評価テンポラリ
                 let estimated_max_reg = (flat_param_count + let_count + expr_temps).min(15);
 
+                let body_node_count = Self::count_ast_nodes(body);
                 let is_leaf = callees.is_empty();
                 self.fn_meta.insert(
                     name.clone(),
@@ -638,10 +643,26 @@ impl CodeGen {
                         is_leaf,
                         flat_param_count,
                         estimated_max_reg,
+                        body_node_count,
                     },
                 );
+                // インライン展開用に関数本体を保存
+                self.fn_bodies
+                    .insert(name.clone(), (params.clone(), body.clone()));
             }
         }
+    }
+
+    /// インライン展開すべきかどうかを判定
+    fn should_inline(&self, name: &str) -> bool {
+        if name == "main" {
+            return false;
+        }
+        let Some(meta) = self.fn_meta.get(name) else {
+            return false;
+        };
+        // リーフ関数 && 小さな本体 && 自己再帰なし
+        meta.is_leaf && meta.body_node_count <= 15 && !meta.callees.contains(name)
     }
 
     /// 式中のユーザー定義関数呼び出しを再帰的に収集
@@ -734,6 +755,74 @@ impl CodeGen {
             StmtKind::Expr(expr) => Self::collect_callees(expr, fn_names, out),
             StmtKind::Return(Some(expr)) => Self::collect_callees(expr, fn_names, out),
             StmtKind::Return(None) | StmtKind::Break => {}
+        }
+    }
+
+    /// AST ノード数を再帰的に数える (インライン判定用)
+    fn count_ast_nodes(expr: &Expr) -> usize {
+        match &expr.kind {
+            ExprKind::IntLiteral(_)
+            | ExprKind::BoolLiteral(_)
+            | ExprKind::Ident(_)
+            | ExprKind::EnumVariant { .. } => 1,
+            ExprKind::BinaryOp { lhs, rhs, .. } => {
+                1 + Self::count_ast_nodes(lhs) + Self::count_ast_nodes(rhs)
+            }
+            ExprKind::UnaryOp { expr, .. } => 1 + Self::count_ast_nodes(expr),
+            ExprKind::Call { args, .. } | ExprKind::BuiltinCall { args, .. } => {
+                1 + args.iter().map(Self::count_ast_nodes).sum::<usize>()
+            }
+            ExprKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                1 + Self::count_ast_nodes(cond)
+                    + Self::count_ast_nodes(then_block)
+                    + else_block
+                        .as_ref()
+                        .map(|e| Self::count_ast_nodes(e))
+                        .unwrap_or(0)
+            }
+            ExprKind::Loop { body } => 1 + Self::count_ast_nodes(body),
+            ExprKind::Block { stmts, expr } => {
+                1 + stmts.iter().map(Self::count_ast_nodes_stmt).sum::<usize>()
+                    + expr.as_ref().map(|e| Self::count_ast_nodes(e)).unwrap_or(0)
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                1 + Self::count_ast_nodes(scrutinee)
+                    + arms
+                        .iter()
+                        .map(|a| 1 + Self::count_ast_nodes(&a.body))
+                        .sum::<usize>()
+            }
+            ExprKind::StructLiteral { fields, base, .. } => {
+                1 + fields
+                    .iter()
+                    .map(|(_, e)| Self::count_ast_nodes(e))
+                    .sum::<usize>()
+                    + base.as_ref().map(|e| Self::count_ast_nodes(e)).unwrap_or(0)
+            }
+            ExprKind::FieldAccess { expr, .. } => 1 + Self::count_ast_nodes(expr),
+            ExprKind::Index { array, index } => {
+                1 + Self::count_ast_nodes(array) + Self::count_ast_nodes(index)
+            }
+            ExprKind::ArrayLiteral(elems) => {
+                1 + elems.iter().map(Self::count_ast_nodes).sum::<usize>()
+            }
+        }
+    }
+
+    fn count_ast_nodes_stmt(stmt: &Stmt) -> usize {
+        match &stmt.kind {
+            StmtKind::Let { value, .. } => 1 + Self::count_ast_nodes(value),
+            StmtKind::Assign { value, .. } => 1 + Self::count_ast_nodes(value),
+            StmtKind::IndexAssign { index, value, .. } => {
+                1 + Self::count_ast_nodes(index) + Self::count_ast_nodes(value)
+            }
+            StmtKind::Expr(expr) => Self::count_ast_nodes(expr),
+            StmtKind::Return(Some(expr)) => 1 + Self::count_ast_nodes(expr),
+            StmtKind::Return(None) | StmtKind::Break => 1,
         }
     }
 
@@ -873,6 +962,96 @@ impl CodeGen {
     }
 
     // ---- コード生成 ----
+
+    /// 関数をインライン展開してコード生成
+    ///
+    /// CALL/RET + caller-save/restore を完全に省略し、
+    /// callee の本体を caller のコンテキストに直接埋め込む。
+    fn codegen_inline_call(&mut self, name: &str, args: &[Expr]) -> ValueLocation {
+        let (params, body) = self.fn_bodies.get(name).unwrap().clone();
+
+        // 1. 引数を評価 (caller のコンテキストで)
+        let mut arg_locs: Vec<(String, Type, ValueLocation)> = Vec::new();
+        for (param, arg) in params.iter().zip(args.iter()) {
+            let loc = self.codegen_expr(arg);
+            arg_locs.push((param.name.clone(), param.ty.clone(), loc));
+        }
+
+        // 2. caller の状態を保存
+        let saved_bindings = self.local_bindings.clone();
+        let saved_next_free_reg = self.next_free_reg;
+        let saved_local_var_count = self.local_var_count;
+
+        // 3. callee のパラメータをバインド
+        self.local_bindings.clear();
+        // next_free_reg はリセットせず、caller のテンポラリ領域の続きを使う
+        // local_var_count は callee のバインディング数に設定
+        self.local_var_count = self.next_free_reg;
+
+        for (param_name, param_ty, loc) in arg_locs {
+            let is_struct = if let Type::UserType(ref tn) = param_ty {
+                self.struct_defs.contains_key(tn)
+            } else {
+                false
+            };
+
+            if is_struct {
+                match loc {
+                    ValueLocation::InMemory { addr, struct_name } => {
+                        // struct 引数がメモリにある場合、そのままバインド
+                        self.local_bindings.insert(
+                            param_name,
+                            LocalBinding::StructInMemory { addr, struct_name },
+                        );
+                    }
+                    ValueLocation::InRegister(reg) => {
+                        // struct がレジスタにある場合 (通常ないが念のため)
+                        let new_reg = self.alloc_register();
+                        if Register::from(new_reg) != reg {
+                            self.emit_op(Opcode::LdReg(new_reg.into(), reg));
+                        }
+                        self.local_bindings
+                            .insert(param_name, LocalBinding::Single(new_reg));
+                    }
+                    ValueLocation::Void => {}
+                }
+            } else if let ValueLocation::InRegister(reg) = loc {
+                // スカラー引数: 新しいレジスタにコピーして callee のパラメータとしてバインド
+                let new_reg = self.alloc_register();
+                if Register::from(new_reg) != reg {
+                    self.emit_op(Opcode::LdReg(new_reg.into(), reg));
+                }
+                self.local_bindings
+                    .insert(param_name, LocalBinding::Single(new_reg));
+            }
+        }
+        self.local_var_count = self.next_free_reg;
+
+        // 4. callee の本体をインラインでコード生成
+        let result = self.codegen_expr(&body);
+
+        // 5. 結果を caller のテンポラリとして保持
+        let final_result = match result {
+            ValueLocation::InRegister(reg) => {
+                // 結果のレジスタは caller のコンテキストで有効なのでそのまま
+                ValueLocation::InRegister(reg)
+            }
+            ValueLocation::InMemory { addr, struct_name } => {
+                ValueLocation::InMemory { addr, struct_name }
+            }
+            ValueLocation::Void => ValueLocation::Void,
+        };
+
+        // 6. caller の状態を復帰 (ただし next_free_reg は結果レジスタを含む値に)
+        self.local_bindings = saved_bindings;
+        self.local_var_count = saved_local_var_count;
+        // next_free_reg は callee が使ったレジスタを含めて維持
+        // (結果レジスタが caller の既存レジスタと重ならないようにするため)
+        // ただし、caller の元の next_free_reg より小さくはしない
+        self.next_free_reg = self.next_free_reg.max(saved_next_free_reg);
+
+        final_result
+    }
 
     /// 末尾位置の式をコード生成 (TCO 対象の自己再帰を検出)
     fn codegen_expr_tail(&mut self, expr: &Expr) -> ValueLocation {
@@ -1234,6 +1413,9 @@ impl CodeGen {
                 }
             }
             ExprKind::BuiltinCall { builtin, args } => self.codegen_builtin_call(*builtin, args),
+            ExprKind::Call { name, args } if self.should_inline(name) => {
+                self.codegen_inline_call(name, args)
+            }
             ExprKind::Call { name, args } => {
                 // ユーザー定義関数: 引数を評価してフラットなレジスタリストを構築
                 let mut flat_args: Vec<Register> = Vec::new();
