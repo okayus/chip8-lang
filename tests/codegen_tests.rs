@@ -1345,3 +1345,91 @@ fn test_inline_reduces_rom_size() {
         call_bytes.len()
     );
 }
+
+// ---- issue #56: struct レジスタ保持 ----
+
+#[test]
+fn test_struct_in_registers_field_access() {
+    // struct パラメータがレジスタに保持されフィールドアクセスが正しいこと
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn get_y(p: Pos) -> u8 { p.y }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 10, y: 42 };
+                get_y(p)
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_struct_param_register_reduces_size() {
+    // struct パラメータのレジスタ保持により ROM サイズが削減されること
+    // (struct パラメータの save/restore が不要になる)
+    let bytes = compile(
+        "struct Pos { x: u8, y: u8 }
+         fn sum_pos(p: Pos) -> u8 { p.x + p.y }
+         fn main() -> u8 { sum_pos(Pos { x: 3, y: 7 }) }",
+    );
+    // sum_pos はインライン展開されるため、コンパクトなバイトコードになる
+    // (パラメータのメモリ退避+再ロードが不要)
+    // struct リテラルはまだメモリ経由だが、フィールドアクセスは最適化済み
+    assert!(
+        bytes.len() <= 70,
+        "struct register optimization should produce compact code, got {} bytes",
+        bytes.len()
+    );
+}
+
+#[test]
+fn test_struct_in_registers_mixed_params() {
+    // struct + scalar 混合パラメータが正しく動作すること
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn offset(p: Pos, dx: u8) -> u8 { p.x + dx }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 10, y: 20 };
+                offset(p, 5)
+             }"
+        ),
+        15
+    );
+}
+
+#[test]
+fn test_struct_let_binding_registers() {
+    // let で struct をバインドした後のフィールドアクセスが正しいこと
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn main() -> u8 {
+                let p: Pos = Pos { x: 30, y: 12 };
+                p.x + p.y
+             }"
+        ),
+        42
+    );
+}
+
+#[test]
+fn test_struct_register_field_access_non_leaf() {
+    // 非リーフ関数で struct パラメータがレジスタに保持され
+    // フィールドアクセスが正しく動作すること
+    assert_eq!(
+        compile_and_run(
+            "struct Pos { x: u8, y: u8 }
+             fn id(x: u8) -> u8 { x }
+             fn sum_pos(p: Pos) -> u8 {
+                let a: u8 = id(p.x);
+                a + p.y
+             }
+             fn main() -> u8 {
+                sum_pos(Pos { x: 10, y: 20 })
+             }"
+        ),
+        30
+    );
+}
