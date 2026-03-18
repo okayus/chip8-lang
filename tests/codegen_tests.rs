@@ -120,11 +120,22 @@ fn test_loop_generates_jp() {
 
 #[test]
 fn test_function_call_generates_call() {
-    // 非リーフ関数は CALL を生成する (インライン展開されない)
+    // 大きな非リーフ関数は CALL を生成する (インライン展開されない)
     let bytes = compile(
-        "fn identity(x: u8) -> u8 { x }
-         fn helper(x: u8) -> u8 { identity(x) + 1 }
-         fn main() -> u8 { helper(5) }",
+        "fn a(x: u8) -> u8 { x }
+         fn b(x: u8) -> u8 { a(x) }
+         fn big(x: u8) -> u8 {
+            let v1: u8 = b(x) + 1;
+            let v2: u8 = b(v1) + 2;
+            let v3: u8 = b(v2) + 3;
+            let v4: u8 = b(v3) + 4;
+            let v5: u8 = b(v4) + 5;
+            let v6: u8 = b(v5) + 6;
+            let v7: u8 = b(v6) + 7;
+            let v8: u8 = b(v7) + 8;
+            v8
+         }
+         fn main() -> u8 { big(5) }",
     );
     // CALL (2NNN) が含まれる
     let has_call = bytes
@@ -245,7 +256,7 @@ fn test_design_doc_program() {
 }
 
 #[test]
-fn test_match_generates_se_jp() {
+fn test_match_consecutive_generates_jump_table() {
     let bytes = compile(
         "fn main() -> u8 {
             let x: u8 = 1;
@@ -256,12 +267,36 @@ fn test_match_generates_se_jp() {
             }
         }",
     );
-    // match はSE+JP パターンを生成するはず
+    // 連続整数パターンの match はジャンプテーブル (BNNN) を生成する
     assert!(bytes.len() > 10);
-    // SE (3xxx) が含まれること
+    assert!(
+        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0xB0),
+        "expected JpV0 (BNNN) instruction in jump table codegen"
+    );
+}
+
+#[test]
+fn test_match_non_consecutive_generates_se_jp() {
+    let bytes = compile(
+        "fn main() -> u8 {
+            let x: u8 = 1;
+            match x {
+                0 => 10,
+                2 => 20,
+                5 => 30,
+            }
+        }",
+    );
+    // 非連続パターンの match は SE+JP フォールバックを使う
+    assert!(bytes.len() > 10);
     assert!(
         bytes.chunks(2).any(|c| c[0] & 0xF0 == 0x30),
-        "expected SE instruction in match codegen"
+        "expected SE instruction in match codegen (fallback)"
+    );
+    // ジャンプテーブルは使われない
+    assert!(
+        !bytes.chunks(2).any(|c| c[0] & 0xF0 == 0xB0),
+        "should not use JpV0 for non-consecutive patterns"
     );
 }
 
@@ -279,17 +314,33 @@ fn test_enum_variant_generates_ld_imm() {
          }",
     );
     assert!(bytes.len() > 4);
+    // enum の variant は 0 始まり連番なのでジャンプテーブルが使われる
+    assert!(
+        bytes.chunks(2).any(|c| c[0] & 0xF0 == 0xB0),
+        "expected JpV0 (BNNN) for enum match with consecutive variants"
+    );
 }
 
 #[test]
 fn test_function_call_saves_registers() {
-    // 非リーフ関数呼び出しでは caller-save が発生する
+    // 大きな非リーフ関数呼び出しでは caller-save が発生する
     let bytes = compile(
-        "fn identity(x: u8) -> u8 { x }
-         fn add_one(x: u8) -> u8 { identity(x) + 1 }
+        "fn a(x: u8) -> u8 { x }
+         fn b(x: u8) -> u8 { a(x) }
+         fn big(x: u8) -> u8 {
+            let v1: u8 = b(x) + 1;
+            let v2: u8 = b(v1) + 2;
+            let v3: u8 = b(v2) + 3;
+            let v4: u8 = b(v3) + 4;
+            let v5: u8 = b(v4) + 5;
+            let v6: u8 = b(v5) + 6;
+            let v7: u8 = b(v6) + 7;
+            let v8: u8 = b(v7) + 8;
+            v8
+         }
          fn main() -> u8 {
             let a: u8 = 5;
-            let b: u8 = add_one(a);
+            let b: u8 = big(a);
             a + b
         }",
     );
@@ -1130,27 +1181,64 @@ fn test_run_issue46_nested_struct_piece_preserved() {
 fn test_leaf_function_fewer_saves() {
     // リーフ関数呼び出しでは caller-save が最適化され、
     // 非リーフ関数より少ない FX55/FX65 が生成されること
+    // (インライン閾値を超える大きな関数を使用)
     let leaf_bytes = compile(
-        "fn add_one(x: u8) -> u8 { x + 1 }
+        "fn big_leaf(x: u8) -> u8 {
+            let a: u8 = x + 1;
+            let b: u8 = a + 2;
+            let c: u8 = b + 3;
+            let d: u8 = c + 4;
+            let e: u8 = d + 5;
+            let f: u8 = e + 6;
+            let g: u8 = f + 7;
+            let h: u8 = g + 8;
+            let i: u8 = h + 9;
+            let j: u8 = i + 10;
+            j
+         }
          fn main() -> u8 {
             let a: u8 = 1;
             let b: u8 = 2;
             let c: u8 = 3;
             let d: u8 = 4;
             let e: u8 = 5;
-            add_one(a) + b + c + d + e
+            big_leaf(a) + b + c + d + e
          }",
     );
     let non_leaf_bytes = compile(
-        "fn identity(x: u8) -> u8 { x }
-         fn add_one(x: u8) -> u8 { identity(x) + 1 }
+        "fn inner(x: u8) -> u8 {
+            let a: u8 = x + 1;
+            let b: u8 = a + 2;
+            let c: u8 = b + 3;
+            let d: u8 = c + 4;
+            let e: u8 = d + 5;
+            let f: u8 = e + 6;
+            let g: u8 = f + 7;
+            let h: u8 = g + 8;
+            let i: u8 = h + 9;
+            let j: u8 = i + 10;
+            j
+         }
+         fn big_non_leaf(x: u8) -> u8 {
+            let a: u8 = inner(x) + 1;
+            let b: u8 = inner(a) + 2;
+            let c: u8 = inner(b) + 3;
+            let d: u8 = inner(c) + 4;
+            let e: u8 = inner(d) + 5;
+            let f: u8 = inner(e) + 6;
+            let g: u8 = inner(f) + 7;
+            let h: u8 = inner(g) + 8;
+            let i: u8 = inner(h) + 9;
+            let j: u8 = inner(i) + 10;
+            j
+         }
          fn main() -> u8 {
             let a: u8 = 1;
             let b: u8 = 2;
             let c: u8 = 3;
             let d: u8 = 4;
             let e: u8 = 5;
-            add_one(a) + b + c + d + e
+            big_non_leaf(a) + b + c + d + e
          }",
     );
 
