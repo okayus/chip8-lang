@@ -302,7 +302,13 @@ impl CodeGen {
                         }
                     }
                 }
-                self.emit_op(Opcode::Ret);
+                if self.current_fn_name.as_deref() == Some("main") {
+                    // main は JP で呼ばれるため RET ではなくセルフループで停止
+                    let halt_addr = self.current_addr();
+                    self.emit_op(Opcode::Jp(halt_addr));
+                } else {
+                    self.emit_op(Opcode::Ret);
+                }
 
                 self.current_fn_name = None;
                 self.current_fn_start_addr = None;
