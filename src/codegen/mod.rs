@@ -1354,14 +1354,6 @@ impl CodeGen {
                 self.emit_op(Opcode::Cls);
                 ValueLocation::InRegister(Register::V0)
             }
-            BuiltinFunction::BeginDrawBatch => {
-                self.emit_op(Opcode::BeginDrawBatch);
-                ValueLocation::InRegister(Register::V0)
-            }
-            BuiltinFunction::EndDrawBatch => {
-                self.emit_op(Opcode::EndDrawBatch);
-                ValueLocation::InRegister(Register::V0)
-            }
             BuiltinFunction::Draw => {
                 if args.len() == 3
                     && let ExprKind::Ident(sprite_name) = &args[0].kind
@@ -1388,14 +1380,6 @@ impl CodeGen {
                 let res = self.alloc_temp_register();
                 self.emit_op(Opcode::LdImm(res.into(), 1));
                 self.emit_op(Opcode::Skp(key_reg));
-                self.emit_op(Opcode::LdImm(res.into(), 0));
-                ValueLocation::InRegister(res.into())
-            }
-            BuiltinFunction::IsKeyJustPressed => {
-                let key_reg = arg_regs[0];
-                let res = self.alloc_temp_register();
-                self.emit_op(Opcode::LdImm(res.into(), 1));
-                self.emit_op(Opcode::Jkp(key_reg));
                 self.emit_op(Opcode::LdImm(res.into(), 0));
                 ValueLocation::InRegister(res.into())
             }

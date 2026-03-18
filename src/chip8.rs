@@ -100,10 +100,6 @@ impl SpriteHeight {
 pub enum Opcode {
     /// 00E0 - 画面クリア
     Cls,
-    /// 00F0 - カスタム: 描画バッチ開始
-    BeginDrawBatch,
-    /// 00F1 - カスタム: 描画バッチ終了
-    EndDrawBatch,
     /// 00EE - サブルーチンからリターン
     Ret,
     /// 1NNN - アドレスにジャンプ
@@ -144,8 +140,6 @@ pub enum Opcode {
     Drw(Register, Register, SpriteHeight),
     /// EX9E - キー Vx が押されていれば次をスキップ
     Skp(Register),
-    /// EX9F - カスタム: キー Vx が直近で押されたなら次をスキップ
-    Jkp(Register),
     /// EXA1 - キー Vx が押されていなければ次をスキップ
     Sknp(Register),
     /// FX07 - Vx = ディレイタイマー
@@ -179,8 +173,6 @@ impl Opcode {
     pub fn encode(self) -> [u8; 2] {
         match self {
             Opcode::Cls => [0x00, 0xE0],
-            Opcode::BeginDrawBatch => [0x00, 0xF0],
-            Opcode::EndDrawBatch => [0x00, 0xF1],
             Opcode::Ret => [0x00, 0xEE],
             Opcode::Jp(addr) => {
                 let nnn = addr.raw();
@@ -210,7 +202,6 @@ impl Opcode {
             Opcode::Rnd(vx, kk) => [0xC0 | vx.index(), kk],
             Opcode::Drw(vx, vy, n) => [0xD0 | vx.index(), (vy.index() << 4) | n.value()],
             Opcode::Skp(vx) => [0xE0 | vx.index(), 0x9E],
-            Opcode::Jkp(vx) => [0xE0 | vx.index(), 0x9F],
             Opcode::Sknp(vx) => [0xE0 | vx.index(), 0xA1],
             Opcode::LdVxDt(vx) => [0xF0 | vx.index(), 0x07],
             Opcode::LdVxK(vx) => [0xF0 | vx.index(), 0x0A],
@@ -242,12 +233,6 @@ mod tests {
     #[test]
     fn test_cls() {
         assert_eq!(Opcode::Cls.encode(), [0x00, 0xE0]);
-    }
-
-    #[test]
-    fn test_draw_batch() {
-        assert_eq!(Opcode::BeginDrawBatch.encode(), [0x00, 0xF0]);
-        assert_eq!(Opcode::EndDrawBatch.encode(), [0x00, 0xF1]);
     }
 
     #[test]
@@ -331,7 +316,6 @@ mod tests {
     fn test_key_ops() {
         let v3 = vx(3);
         assert_eq!(Opcode::Skp(v3).encode(), [0xE3, 0x9E]);
-        assert_eq!(Opcode::Jkp(v3).encode(), [0xE3, 0x9F]);
         assert_eq!(Opcode::Sknp(v3).encode(), [0xE3, 0xA1]);
     }
 
