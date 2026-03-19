@@ -1626,3 +1626,33 @@ fn test_nested_if_else_no_overflow() {
         9 // a=3 > 0 → x=4, y=5. x=4 > 5? No → w = x+c = 4+5 = 9
     );
 }
+
+#[test]
+fn test_run_issue64_expr_arg_does_not_corrupt_variable() {
+    // y を「そのまま」と「y + 1」の両方で渡すとき、y + 1 の計算が y を破壊しないこと
+    assert_eq!(
+        compile_and_run(
+            "fn callee(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8) -> u8 { d }
+             fn main() -> u8 {
+               let y: u8 = 10;
+               callee(0, 0, 0, y, 0, y + 1)
+             }"
+        ),
+        10 // d = y = 10, not 11
+    );
+}
+
+#[test]
+fn test_run_issue64_sub_does_not_corrupt_variable() {
+    // Sub でも同様に変数が破壊されないこと
+    assert_eq!(
+        compile_and_run(
+            "fn callee(a: u8, b: u8, c: u8, d: u8) -> u8 { b }
+             fn main() -> u8 {
+               let x: u8 = 20;
+               callee(0, x, 0, x - 3)
+             }"
+        ),
+        20 // b = x = 20, not 17
+    );
+}
