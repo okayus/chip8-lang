@@ -1656,3 +1656,51 @@ fn test_run_issue64_sub_does_not_corrupt_variable() {
         20 // b = x = 20, not 17
     );
 }
+
+#[test]
+fn test_run_issue66_let_add_does_not_corrupt_variable() {
+    // let ny = y + 1 で y が破壊されないこと
+    assert_eq!(
+        compile_and_run(
+            "fn check(a: u8, b: u8) -> u8 { a }
+             fn main() -> u8 {
+               let y: u8 = 10;
+               let ny: u8 = y + 1;
+               check(y, ny)
+             }"
+        ),
+        10 // y = 10, not 11
+    );
+}
+
+#[test]
+fn test_run_issue66_let_sub_does_not_corrupt_variable() {
+    // let ny = y - 1 で y が破壊されないこと
+    assert_eq!(
+        compile_and_run(
+            "fn check(a: u8, b: u8) -> u8 { a }
+             fn main() -> u8 {
+               let y: u8 = 10;
+               let ny: u8 = y - 1;
+               check(y, ny)
+             }"
+        ),
+        10 // y = 10, not 9
+    );
+}
+
+#[test]
+fn test_run_issue66_not_does_not_corrupt_variable() {
+    // let b = !flag で flag が破壊されないこと
+    assert_eq!(
+        compile_and_run(
+            "fn to_u8(x: bool) -> u8 { if x { 1 } else { 0 } }
+             fn main() -> u8 {
+               let flag: bool = true;
+               let b: bool = !flag;
+               to_u8(flag)
+             }"
+        ),
+        1 // flag = true (1), not false (0)
+    );
+}
