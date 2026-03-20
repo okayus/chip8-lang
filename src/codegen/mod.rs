@@ -468,6 +468,62 @@ impl CodeGen {
         reg.index() < self.local_var_count
     }
 
+    /// flat_args のレジスタを V0, V1, ... にコピーする。
+    /// 順次コピーでソースが上書きされる場合 (並列代入問題) を検出し、
+    /// 一時レジスタ経由でコピーすることで正しい値を保証する。
+    /// レジスタアロケータを使わず直接レジスタを選択するため、
+    /// レジスタ圧力が高い状況でもオーバーフローしない。
+    fn emit_parallel_move(&mut self, flat_args: &[Register], param_count: usize) {
+        let count = flat_args.len().min(param_count);
+        // saved[i] = Some(tmp): ターゲット V_i の元の値を tmp に退避済み
+        let mut saved: Vec<Option<Register>> = vec![None; count];
+
+        // 一時レジスタの開始位置: 全ソース・ターゲットの最大インデックス + 1
+        let max_idx = flat_args
+            .iter()
+            .take(count)
+            .map(|r| r.index())
+            .max()
+            .unwrap_or(0)
+            .max(count.saturating_sub(1) as u8);
+        let mut next_tmp = max_idx + 1;
+
+        // 各コピーのターゲットが後続コピーのソースとして使われるか検査
+        for i in 0..count {
+            let target: Register = UserRegister::new(i as u8).into();
+            if flat_args[i] == target {
+                continue; // no-op: コピー不要
+            }
+            let will_be_read_later = (i + 1..count).any(|j| {
+                let target_j: Register = UserRegister::new(j as u8).into();
+                flat_args[j] == target && flat_args[j] != target_j
+            });
+            if will_be_read_later {
+                assert!(next_tmp <= 14, "not enough temp registers for parallel move");
+                let tmp: Register = UserRegister::new(next_tmp).into();
+                next_tmp += 1;
+                self.emit_op(Opcode::LdReg(tmp, target));
+                saved[i] = Some(tmp);
+            }
+        }
+
+        // 実際のコピー: ソースが退避済みなら退避先を使用
+        for (i, &arg_reg) in flat_args.iter().enumerate().take(count) {
+            let target: Register = UserRegister::new(i as u8).into();
+            let mut src = arg_reg;
+            // ソースレジスタが退避済みの場合、退避先レジスタを使う
+            let src_idx = src.index() as usize;
+            if src_idx < count
+                && let Some(saved_reg) = saved[src_idx]
+            {
+                src = saved_reg;
+            }
+            if src != target {
+                self.emit_op(Opcode::LdReg(target, src));
+            }
+        }
+    }
+
     /// 引数式がレジスタを変更しない安全な式かを判定する。
     /// リテラルや単純な変数参照は既存レジスタを破壊しない。
     fn is_safe_arg(expr: &Expr) -> bool {
@@ -1322,13 +1378,8 @@ impl CodeGen {
                     }
                 }
 
-                // flat_args → V0, V1, ... にコピー (パラメータ上書き)
-                for i in 0..param_count {
-                    let target: Register = UserRegister::new(i).into();
-                    if (i as usize) < flat_args.len() && flat_args[i as usize] != target {
-                        self.emit_op(Opcode::LdReg(target, flat_args[i as usize]));
-                    }
-                }
+                // flat_args → V0, V1, ... にコピー (並列代入で上書き回避)
+                self.emit_parallel_move(&flat_args, param_count as usize);
 
                 // 関数先頭にジャンプ (CALL + RET の代わり)
                 self.emit_op(Opcode::Jp(fn_start));
@@ -1835,13 +1886,8 @@ impl CodeGen {
                     self.next_save_slot += num_to_save as u16;
                 }
 
-                // 引数を V0, V1, ... にコピー
-                for (i, &arg_reg) in flat_args.iter().enumerate() {
-                    let target: Register = UserRegister::new(i as u8).into();
-                    if arg_reg != target {
-                        self.emit_op(Opcode::LdReg(target, arg_reg));
-                    }
-                }
+                // 引数を V0, V1, ... にコピー (並列代入で上書き回避)
+                self.emit_parallel_move(&flat_args, flat_args.len());
 
                 // CALL
                 let offset = self.emit_placeholder();
