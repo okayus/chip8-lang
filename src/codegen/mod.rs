@@ -1420,6 +1420,16 @@ impl CodeGen {
                         _ => {}
                     }
 
+                    // else ブランチの結果を then ブランチの結果レジスタに合わせる
+                    if !then_is_struct
+                        && !else_is_struct
+                        && let (ValueLocation::InRegister(tr), ValueLocation::InRegister(er)) =
+                            (&then_loc, &else_loc)
+                        && tr != er
+                    {
+                        self.emit_op(Opcode::LdReg(*tr, *er));
+                    }
+
                     let end_addr = self.current_addr();
                     self.patch_at(jp_end_offset, Opcode::Jp(end_addr));
 
@@ -1427,8 +1437,8 @@ impl CodeGen {
                         _ if then_is_struct || else_is_struct => {
                             ValueLocation::InRegister(Register::V0)
                         }
-                        (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
                         (ValueLocation::InRegister(r), _) => ValueLocation::InRegister(r),
+                        (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
                         _ => ValueLocation::Void,
                     }
                 } else {
@@ -1569,6 +1579,17 @@ impl CodeGen {
                 let Some(rhs_reg) = self.codegen_expr(rhs).register() else {
                     return ValueLocation::Void;
                 };
+                // Add/Sub/And/Or は lhs_reg を直接変更するため、
+                // 変数レジスタならテンポラリにコピーして保護する (issue #66)
+                let lhs_reg = if matches!(op, BinOp::Add | BinOp::Sub | BinOp::And | BinOp::Or)
+                    && self.is_variable_register(lhs_reg)
+                {
+                    let tmp = self.alloc_temp_register();
+                    self.emit_op(Opcode::LdReg(tmp.into(), lhs_reg));
+                    Register::from(tmp)
+                } else {
+                    lhs_reg
+                };
                 let result_reg = lhs_reg;
                 match op {
                     BinOp::Add => {
@@ -1708,10 +1729,18 @@ impl CodeGen {
                         ValueLocation::InRegister(zero.into())
                     }
                     UnaryOp::Not => {
+                        // 変数レジスタを直接演算で破壊しないようテンポラリにコピー (issue #66)
+                        let tmp = if self.is_variable_register(reg) {
+                            let t = self.alloc_temp_register();
+                            self.emit_op(Opcode::LdReg(t.into(), reg));
+                            t.into()
+                        } else {
+                            reg
+                        };
                         let one = self.alloc_temp_register();
                         self.emit_op(Opcode::LdImm(one.into(), 0x01));
-                        self.emit_op(Opcode::Xor(reg, one.into()));
-                        ValueLocation::InRegister(reg)
+                        self.emit_op(Opcode::Xor(tmp, one.into()));
+                        ValueLocation::InRegister(tmp)
                     }
                 }
             }
@@ -1957,6 +1986,17 @@ impl CodeGen {
                         _ => {}
                     }
 
+                    // else ブランチの結果を then ブランチの結果レジスタに合わせる
+                    // (スカラーで結果レジスタが異なる場合)
+                    if !then_is_struct
+                        && !else_is_struct
+                        && let (ValueLocation::InRegister(tr), ValueLocation::InRegister(er)) =
+                            (&then_loc, &else_loc)
+                        && tr != er
+                    {
+                        self.emit_op(Opcode::LdReg(*tr, *er));
+                    }
+
                     let end_addr = self.current_addr();
                     self.patch_at(jp_end_offset, Opcode::Jp(end_addr));
 
@@ -1964,8 +2004,8 @@ impl CodeGen {
                         _ if then_is_struct || else_is_struct => {
                             ValueLocation::InRegister(Register::V0)
                         }
-                        (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
                         (ValueLocation::InRegister(r), _) => ValueLocation::InRegister(r),
+                        (_, ValueLocation::InRegister(r)) => ValueLocation::InRegister(r),
                         _ => ValueLocation::Void,
                     }
                 } else {
