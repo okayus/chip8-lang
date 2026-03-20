@@ -1690,6 +1690,41 @@ fn test_run_issue66_let_sub_does_not_corrupt_variable() {
 }
 
 #[test]
+fn test_run_arg_copy_does_not_clobber_source_register() {
+    // 引数コピーの並列代入問題: flat_args のソースレジスタが
+    // 先行コピーで上書きされるケースをテスト。
+    // spawn_piece(np, sc + 1, sp) で sp が sc+1 に化けていたバグの再現。
+    assert_eq!(
+        compile_and_run(
+            "fn callee(a: u8, b: u8, c: u8) -> u8 { c }
+             fn main() -> u8 {
+               let sc: u8 = 0;
+               let sp: u8 = 60;
+               let np: u8 = 3;
+               callee(np, sc + 1, sp)
+             }"
+        ),
+        60 // sp = 60 が正しく渡されること (バグ時は sc+1 = 1)
+    );
+}
+
+#[test]
+fn test_run_arg_copy_swap_pattern() {
+    // V0←V1, V1←V0 のスワップパターンが正しく動作すること
+    assert_eq!(
+        compile_and_run(
+            "fn callee(a: u8, b: u8) -> u8 { b }
+             fn main() -> u8 {
+               let x: u8 = 10;
+               let y: u8 = 20;
+               callee(y, x)
+             }"
+        ),
+        10 // x = 10 が b に正しく渡されること
+    );
+}
+
+#[test]
 fn test_run_issue66_not_does_not_corrupt_variable() {
     // let b = !flag で flag が破壊されないこと
     assert_eq!(
