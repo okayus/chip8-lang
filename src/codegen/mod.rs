@@ -462,6 +462,49 @@ impl CodeGen {
         self.alloc_register()
     }
 
+    /// レジスタがローカル変数にバインドされているか判定する。
+    /// 変数レジスタは index < local_var_count の範囲に割り当てられる。
+    fn is_variable_register(&self, reg: Register) -> bool {
+        reg.index() < self.local_var_count
+    }
+
+    /// 引数式がレジスタを変更しない安全な式かを判定する。
+    /// リテラルや単純な変数参照は既存レジスタを破壊しない。
+    fn is_safe_arg(expr: &Expr) -> bool {
+        matches!(
+            expr.kind,
+            ExprKind::Ident(_)
+                | ExprKind::IntLiteral(_)
+                | ExprKind::BoolLiteral(_)
+                | ExprKind::EnumVariant { .. }
+        )
+    }
+
+    /// 式中で参照されている変数名を収集する。
+    fn collect_referenced_vars(expr: &Expr, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Ident(name) => {
+                out.insert(name.clone());
+            }
+            ExprKind::BinaryOp { lhs, rhs, .. } => {
+                Self::collect_referenced_vars(lhs, out);
+                Self::collect_referenced_vars(rhs, out);
+            }
+            ExprKind::UnaryOp { expr, .. } => {
+                Self::collect_referenced_vars(expr, out);
+            }
+            ExprKind::Call { args, .. } | ExprKind::BuiltinCall { args, .. } => {
+                for a in args {
+                    Self::collect_referenced_vars(a, out);
+                }
+            }
+            ExprKind::FieldAccess { expr, .. } => {
+                Self::collect_referenced_vars(expr, out);
+            }
+            _ => {}
+        }
+    }
+
     fn lookup_binding(&self, name: &str) -> Option<&LocalBinding> {
         self.local_bindings.get(name)
     }
@@ -1097,9 +1140,40 @@ impl CodeGen {
         let (params, body) = self.fn_bodies.get(name).unwrap().clone();
 
         // 1. 引数を評価 (caller のコンテキストで)
+        // 後続の式引数で実際に参照される変数レジスタのみ一時レジスタにコピーして
+        // 保護する。式引数の評価が元の変数レジスタを破壊しても、先に評価済みの
+        // 引数値が影響を受けないようにする。(issue #64)
+        let has_expr_args = args.iter().any(|a| !Self::is_safe_arg(a));
         let mut arg_locs: Vec<(String, Type, ValueLocation)> = Vec::new();
-        for (param, arg) in params.iter().zip(args.iter()) {
+        for (i, (param, arg)) in params.iter().zip(args.iter()).enumerate() {
             let loc = self.codegen_expr(arg);
+            let needs_protect = if has_expr_args {
+                if let ExprKind::Ident(name) = &arg.kind {
+                    let mut later_vars = HashSet::new();
+                    for later in &args[i + 1..] {
+                        if !Self::is_safe_arg(later) {
+                            Self::collect_referenced_vars(later, &mut later_vars);
+                        }
+                    }
+                    later_vars.contains(name)
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let loc = if needs_protect {
+                match loc {
+                    ValueLocation::InRegister(reg) if self.is_variable_register(reg) => {
+                        let tmp = self.alloc_temp_register();
+                        self.emit_op(Opcode::LdReg(tmp.into(), reg));
+                        ValueLocation::InRegister(tmp.into())
+                    }
+                    other => other,
+                }
+            } else {
+                loc
+            };
             arg_locs.push((param.name.clone(), param.ty.clone(), loc));
         }
 
@@ -1647,9 +1721,27 @@ impl CodeGen {
             }
             ExprKind::Call { name, args } => {
                 // ユーザー定義関数: 引数を評価してフラットなレジスタリストを構築
+                // 後続の式引数で実際に参照される変数レジスタのみ一時レジスタに
+                // コピーして保護する。(issue #64)
+                let has_expr_args = args.iter().any(|a| !Self::is_safe_arg(a));
                 let mut flat_args: Vec<Register> = Vec::new();
-                for arg in args {
+                for (i, arg) in args.iter().enumerate() {
                     let loc = self.codegen_expr(arg);
+                    let needs_protect = if has_expr_args {
+                        if let ExprKind::Ident(name) = &arg.kind {
+                            let mut later_vars = HashSet::new();
+                            for later in &args[i + 1..] {
+                                if !Self::is_safe_arg(later) {
+                                    Self::collect_referenced_vars(later, &mut later_vars);
+                                }
+                            }
+                            later_vars.contains(name)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     match loc {
                         ValueLocation::InMemory {
                             addr,
@@ -1668,14 +1760,27 @@ impl CodeGen {
                             field_count,
                             ..
                         } => {
-                            // struct 引数: レジスタから直接フラット化
+                            // struct 引数: レジスタからフラット化
                             for i in 0..field_count {
-                                flat_args.push(UserRegister::new(base_reg.index() + i).into());
+                                let src = Register::from(UserRegister::new(base_reg.index() + i));
+                                if needs_protect && self.is_variable_register(src) {
+                                    let tmp = self.alloc_temp_register();
+                                    self.emit_op(Opcode::LdReg(tmp.into(), src));
+                                    flat_args.push(tmp.into());
+                                } else {
+                                    flat_args.push(src);
+                                }
                             }
                         }
                         _ => {
                             if let Some(reg) = loc.register() {
-                                flat_args.push(reg);
+                                if needs_protect && self.is_variable_register(reg) {
+                                    let tmp = self.alloc_temp_register();
+                                    self.emit_op(Opcode::LdReg(tmp.into(), reg));
+                                    flat_args.push(tmp.into());
+                                } else {
+                                    flat_args.push(reg);
+                                }
                             }
                         }
                     }
