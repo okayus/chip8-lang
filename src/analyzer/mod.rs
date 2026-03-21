@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::lexer::token::Span;
 use crate::parser::ast::*;
 
 /// UserRegister の総数 (V0-VE)
@@ -114,6 +115,7 @@ pub enum AnalyzeErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyzeError {
     pub kind: AnalyzeErrorKind,
+    pub span: Span,
 }
 
 impl std::fmt::Display for AnalyzeError {
@@ -331,23 +333,27 @@ impl Analyzer {
         if !self.functions.contains_key("main") {
             self.errors.push(AnalyzeError {
                 kind: AnalyzeErrorKind::MissingMain,
+                span: Span { line: 1, column: 1 },
             });
         }
 
         // UserType 型の存在チェック (enum または struct)
         for top in &program.top_levels {
-            let types_to_check: Vec<&Type> = match top {
+            let (types_to_check, span): (Vec<&Type>, Span) = match top {
                 TopLevel::FnDef {
                     params,
                     return_type,
+                    span,
                     ..
                 } => {
                     let mut ts: Vec<&Type> = params.iter().map(|p| &p.ty).collect();
                     ts.push(return_type);
-                    ts
+                    (ts, *span)
                 }
-                TopLevel::LetDef { ty, .. } => vec![ty],
-                TopLevel::EnumDef { .. } | TopLevel::StructDef { .. } => vec![],
+                TopLevel::LetDef { ty, span, .. } => (vec![ty], *span),
+                TopLevel::EnumDef { span, .. } | TopLevel::StructDef { span, .. } => {
+                    (vec![], *span)
+                }
             };
             for ty in types_to_check {
                 if let Type::UserType(name) = ty
@@ -356,6 +362,7 @@ impl Analyzer {
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UnknownType(name.clone()),
+                        span,
                     });
                 }
             }
@@ -375,6 +382,7 @@ impl Analyzer {
                                 expected: ty.clone(),
                                 found: vt,
                             },
+                            span: value.span,
                         });
                     }
                 }
@@ -382,6 +390,7 @@ impl Analyzer {
                     params,
                     return_type,
                     body,
+                    span,
                     ..
                 } => {
                     self.current_return_type = Some(return_type.clone());
@@ -401,6 +410,7 @@ impl Analyzer {
                                 expected: return_type.clone(),
                                 found: bt,
                             },
+                            span: body.span,
                         });
                     }
 
@@ -423,6 +433,7 @@ impl Analyzer {
                                     count: reg_count,
                                     max: MAX_LOCALS,
                                 },
+                                span: *span,
                             });
                         }
                     }
@@ -481,6 +492,7 @@ impl Analyzer {
                 } else {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UndefinedVariable(name.clone()),
+                        span: expr.span,
                     });
                     None
                 }
@@ -493,6 +505,7 @@ impl Analyzer {
                         if !Self::types_compatible(&lt, &rt) {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::BinaryOpTypeMismatch { lhs: lt, rhs: rt },
+                                span: expr.span,
                             });
                             return None;
                         }
@@ -507,6 +520,7 @@ impl Analyzer {
                                 if lt != Type::Bool {
                                     self.errors.push(AnalyzeError {
                                         kind: AnalyzeErrorKind::LogicalOpRequiresBool(lt),
+                                        span: expr.span,
                                     });
                                     None
                                 } else {
@@ -526,6 +540,7 @@ impl Analyzer {
                         if ty != Type::U8 {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::NegationRequiresU8(ty),
+                                span: expr.span,
                             });
                             None
                         } else {
@@ -536,6 +551,7 @@ impl Analyzer {
                         if ty != Type::Bool {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::LogicalNotRequiresBool(ty),
+                                span: expr.span,
                             });
                             None
                         } else {
@@ -554,6 +570,7 @@ impl Analyzer {
                                 expected: 1,
                                 found: args.len(),
                             },
+                            span: expr.span,
                         });
                         return None;
                     }
@@ -563,6 +580,7 @@ impl Analyzer {
                         } else {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::RandomEnumArgNotEnum(name.clone()),
+                                span: expr.span,
                             });
                             return None;
                         }
@@ -571,6 +589,7 @@ impl Analyzer {
                             kind: AnalyzeErrorKind::RandomEnumArgNotEnum(
                                 "<non-identifier>".to_string(),
                             ),
+                            span: expr.span,
                         });
                         return None;
                     }
@@ -584,6 +603,7 @@ impl Analyzer {
                             expected: param_types.len(),
                             found: args.len(),
                         },
+                        span: expr.span,
                     });
                     return None;
                 }
@@ -597,6 +617,7 @@ impl Analyzer {
                                 expected: param_ty.clone(),
                                 found: arg_ty,
                             },
+                            span: expr.span,
                         });
                     }
                 }
@@ -611,6 +632,7 @@ impl Analyzer {
                                 expected: sig.params.len(),
                                 found: args.len(),
                             },
+                            span: expr.span,
                         });
                         return None;
                     }
@@ -624,6 +646,7 @@ impl Analyzer {
                                     expected: param_ty.clone(),
                                     found: arg_ty,
                                 },
+                                span: expr.span,
                             });
                         }
                     }
@@ -631,6 +654,7 @@ impl Analyzer {
                 } else {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UndefinedFunction(name.clone()),
+                        span: expr.span,
                     });
                     None
                 }
@@ -645,6 +669,7 @@ impl Analyzer {
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::IfConditionNotBool(cond_ty),
+                        span: expr.span,
                     });
                 }
                 let then_ty = self.type_check_expr(then_block);
@@ -658,6 +683,7 @@ impl Analyzer {
                                         then_type: t,
                                         else_type: e,
                                     },
+                                    span: expr.span,
                                 });
                                 None
                             } else {
@@ -697,6 +723,7 @@ impl Analyzer {
                     {
                         self.errors.push(AnalyzeError {
                             kind: AnalyzeErrorKind::ArrayElementMismatch,
+                            span: expr.span,
                         });
                     }
                 }
@@ -710,11 +737,13 @@ impl Analyzer {
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::MatchScrutineeType(st.clone()),
+                        span: expr.span,
                     });
                 }
                 if arms.is_empty() {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::MatchNoArms,
+                        span: expr.span,
                     });
                     return None;
                 }
@@ -726,6 +755,7 @@ impl Analyzer {
                         _ => {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::MatchArmPatternNotLiteral,
+                                span: expr.span,
                             });
                         }
                     }
@@ -754,6 +784,7 @@ impl Analyzer {
                                 enum_name: enum_name.clone(),
                                 missing,
                             },
+                            span: expr.span,
                         });
                     }
                 }
@@ -768,6 +799,7 @@ impl Analyzer {
                                 first: first_ty.clone(),
                                 found: arm_ty,
                             },
+                            span: expr.span,
                         });
                     }
                 }
@@ -786,6 +818,7 @@ impl Analyzer {
                                 expected: Type::UserType(name.clone()),
                                 found: base_ty,
                             },
+                            span: expr.span,
                         });
                     }
                     // 重複フィールドチェック
@@ -797,6 +830,7 @@ impl Analyzer {
                                     struct_name: name.clone(),
                                     field: field_name.clone(),
                                 },
+                                span: expr.span,
                             });
                         }
                         seen.push(field_name.clone());
@@ -811,6 +845,7 @@ impl Analyzer {
                                         expected: sf.ty.clone(),
                                         found: val_ty,
                                     },
+                                    span: expr.span,
                                 });
                             }
                         } else {
@@ -819,6 +854,7 @@ impl Analyzer {
                                     struct_name: name.clone(),
                                     field: field_name.clone(),
                                 },
+                                span: expr.span,
                             });
                         }
                     }
@@ -835,6 +871,7 @@ impl Analyzer {
                                     struct_name: name.clone(),
                                     missing,
                                 },
+                                span: expr.span,
                             });
                         }
                     }
@@ -842,6 +879,7 @@ impl Analyzer {
                 } else {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UndefinedStruct(name.clone()),
+                        span: expr.span,
                     });
                     None
                 }
@@ -858,6 +896,7 @@ impl Analyzer {
                                         struct_name: struct_name.clone(),
                                         field: field.clone(),
                                     },
+                                    span: expr.span,
                                 });
                                 None
                             }
@@ -865,12 +904,14 @@ impl Analyzer {
                             // UserType だが struct ではない (enum)
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::FieldAccessOnNonStruct(ty),
+                                span: expr.span,
                             });
                             None
                         }
                     } else {
                         self.errors.push(AnalyzeError {
                             kind: AnalyzeErrorKind::FieldAccessOnNonStruct(ty),
+                            span: expr.span,
                         });
                         None
                     }
@@ -886,6 +927,7 @@ impl Analyzer {
                                 enum_name: enum_name.clone(),
                                 variant: variant.clone(),
                             },
+                            span: expr.span,
                         });
                         None
                     } else {
@@ -894,6 +936,7 @@ impl Analyzer {
                 } else {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UndefinedEnum(enum_name.clone()),
+                        span: expr.span,
                     });
                     None
                 }
@@ -907,6 +950,7 @@ impl Analyzer {
                             {
                                 self.errors.push(AnalyzeError {
                                     kind: AnalyzeErrorKind::ArrayIndexNotU8(idx_ty),
+                                    span: expr.span,
                                 });
                             }
                             Some(*elem_ty)
@@ -914,6 +958,7 @@ impl Analyzer {
                         _ => {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::CannotIndex(arr_ty),
+                                span: expr.span,
                             });
                             None
                         }
@@ -935,6 +980,7 @@ impl Analyzer {
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UnknownType(type_name.clone()),
+                        span: stmt.span,
                     });
                 }
                 if let Some(vt) = self.type_check_expr(value)
@@ -946,6 +992,7 @@ impl Analyzer {
                             expected: ty.clone(),
                             found: vt,
                         },
+                        span: stmt.span,
                     });
                 }
                 self.insert_local(name.clone(), ty.clone());
@@ -959,12 +1006,14 @@ impl Analyzer {
                 if is_global && !self.mutable_globals.contains(name) {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::ImmutableAssignment(name.clone()),
+                        span: stmt.span,
                     });
                 }
                 match (var_ty, val_ty) {
                     (None, _) => {
                         self.errors.push(AnalyzeError {
                             kind: AnalyzeErrorKind::UndefinedVariable(name.clone()),
+                            span: stmt.span,
                         });
                     }
                     (Some(vt), Some(et)) => {
@@ -974,6 +1023,7 @@ impl Analyzer {
                                     expected: vt,
                                     found: et,
                                 },
+                                span: stmt.span,
                             });
                         }
                     }
@@ -991,11 +1041,13 @@ impl Analyzer {
                     if !matches!(ty, Type::Array { .. }) {
                         self.errors.push(AnalyzeError {
                             kind: AnalyzeErrorKind::CannotIndex(ty.clone()),
+                            span: stmt.span,
                         });
                     }
                 } else {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::UndefinedVariable(array.clone()),
+                        span: stmt.span,
                     });
                 }
                 // インデックスは u8
@@ -1004,6 +1056,7 @@ impl Analyzer {
                 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::ArrayIndexNotU8(idx_ty),
+                        span: stmt.span,
                     });
                 }
                 // 値の型チェック
@@ -1014,6 +1067,7 @@ impl Analyzer {
                 if is_global && !self.mutable_globals.contains(array) {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::ImmutableAssignment(array.clone()),
+                        span: stmt.span,
                     });
                 }
             }
@@ -1035,6 +1089,7 @@ impl Analyzer {
                             expected: expected.clone(),
                             found: actual.clone(),
                         },
+                        span: stmt.span,
                     });
                 }
             }
@@ -1042,6 +1097,7 @@ impl Analyzer {
                 if self.loop_depth == 0 {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::BreakOutsideLoop,
+                        span: stmt.span,
                     });
                 }
             }
