@@ -2,5 +2,10 @@
 name = "chip8-lang"
 version = "0.1.0"
 edition = "2024"
+description = "A small functional language compiler targeting CHIP-8 ROMs"
+license = "MIT"
+repository = "https://github.com/okayus/chip8-lang"
+keywords = ["chip8", "compiler", "language"]
+categories = ["compilers"]
 
 [dependencies]
