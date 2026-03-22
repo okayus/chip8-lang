@@ -15,5 +15,7 @@ pub mod codegen;
 pub mod emitter;
 /// ソースコードからトークン列への字句解析
 pub mod lexer;
+/// 識別子の newtype (関数名・変数名・型名・フィールド名・バリアント名)
+pub mod names;
 /// トークン列から AST への構文解析
 pub mod parser;

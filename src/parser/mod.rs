@@ -1,6 +1,7 @@
 pub mod ast;
 
 use crate::lexer::token::{Span, Token, TokenKind};
+use crate::names::{FieldName, FunctionName, TypeName, VariableName, VariantName};
 use ast::*;
 
 /// パースエラーの種類
@@ -155,7 +156,7 @@ impl Parser {
         let return_type = self.parse_type()?;
         let body = self.parse_block_expr()?;
         Ok(TopLevel::FnDef {
-            name,
+            name: FunctionName::from(name),
             params,
             return_type,
             body,
@@ -172,7 +173,10 @@ impl Parser {
             let (name, _) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
-            params.push(Param { name, ty });
+            params.push(Param {
+                name: VariableName::from(name),
+                ty,
+            });
             if self.peek() == &TokenKind::Comma {
                 self.advance();
             } else {
@@ -196,7 +200,7 @@ impl Parser {
         let value = self.parse_expr()?;
         self.expect(&TokenKind::Semicolon)?;
         Ok(TopLevel::LetDef {
-            name,
+            name: VariableName::from(name),
             ty,
             value,
             mutable,
@@ -212,14 +216,14 @@ impl Parser {
         let mut variants = Vec::new();
         while self.peek() != &TokenKind::RBrace {
             let (variant, _) = self.expect_ident()?;
-            variants.push(variant);
+            variants.push(VariantName::from(variant));
             if self.peek() == &TokenKind::Comma {
                 self.advance();
             }
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(TopLevel::EnumDef {
-            name,
+            name: TypeName::from(name),
             variants,
             span,
         })
@@ -236,7 +240,7 @@ impl Parser {
             self.expect(&TokenKind::Colon)?;
             let ty = self.parse_type()?;
             fields.push(StructField {
-                name: field_name,
+                name: FieldName::from(field_name),
                 ty,
             });
             if self.peek() == &TokenKind::Comma {
@@ -244,7 +248,11 @@ impl Parser {
             }
         }
         self.expect(&TokenKind::RBrace)?;
-        Ok(TopLevel::StructDef { name, fields, span })
+        Ok(TopLevel::StructDef {
+            name: TypeName::from(name),
+            fields,
+            span,
+        })
     }
 
     // ---- 型 ----
@@ -263,7 +271,7 @@ impl Parser {
                         self.expect(&TokenKind::RParen)?;
                         Ok(Type::Sprite(size as usize))
                     }
-                    _ => Ok(Type::UserType(name)),
+                    _ => Ok(Type::UserType(TypeName::from(name))),
                 }
             }
             TokenKind::LParen => {
@@ -320,7 +328,11 @@ impl Parser {
                 let value = self.parse_expr()?;
                 self.expect(&TokenKind::Semicolon)?;
                 Ok(Stmt {
-                    kind: StmtKind::Let { name, ty, value },
+                    kind: StmtKind::Let {
+                        name: VariableName::from(name),
+                        ty,
+                        value,
+                    },
                     span,
                 })
             }
@@ -502,7 +514,7 @@ impl Parser {
                 expr = Expr {
                     kind: ExprKind::FieldAccess {
                         expr: Box::new(expr),
-                        field,
+                        field: FieldName::from(field),
                     },
                     span,
                 };
@@ -545,8 +557,8 @@ impl Parser {
                     let (variant, _) = self.expect_ident()?;
                     return Ok(Expr {
                         kind: ExprKind::EnumVariant {
-                            enum_name: name,
-                            variant,
+                            enum_name: TypeName::from(name),
+                            variant: VariantName::from(variant),
                         },
                         span,
                     });
@@ -575,12 +587,15 @@ impl Parser {
                     let kind = if let Some(builtin) = BuiltinFunction::from_name(&name) {
                         ExprKind::BuiltinCall { builtin, args }
                     } else {
-                        ExprKind::Call { name, args }
+                        ExprKind::Call {
+                            name: FunctionName::from(name),
+                            args,
+                        }
                     };
                     Ok(Expr { kind, span })
                 } else {
                     Ok(Expr {
-                        kind: ExprKind::Ident(name),
+                        kind: ExprKind::Ident(VariableName::from(name)),
                         span,
                     })
                 }
@@ -649,14 +664,18 @@ impl Parser {
             let (field_name, _) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             let value = self.parse_expr()?;
-            fields.push((field_name, value));
+            fields.push((FieldName::from(field_name), value));
             if self.peek() == &TokenKind::Comma {
                 self.advance();
             }
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(Expr {
-            kind: ExprKind::StructLiteral { name, fields, base },
+            kind: ExprKind::StructLiteral {
+                name: TypeName::from(name),
+                fields,
+                base,
+            },
             span,
         })
     }
@@ -840,7 +859,10 @@ impl Parser {
         let kind = if let Some(builtin) = BuiltinFunction::from_name(&name) {
             ExprKind::BuiltinCall { builtin, args }
         } else {
-            ExprKind::Call { name, args }
+            ExprKind::Call {
+                name: FunctionName::from(name),
+                args,
+            }
         };
         Ok(Expr { kind, span })
     }

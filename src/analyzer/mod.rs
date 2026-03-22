@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::lexer::token::Span;
+use crate::names::{FieldName, FunctionName, TypeName, VariableName, VariantName};
 use crate::parser::ast::*;
 
 /// UserRegister の総数 (V0-VE)
@@ -16,9 +17,9 @@ pub enum AnalyzeErrorKind {
     /// main 関数が定義されていない
     MissingMain,
     /// 未定義の変数を参照
-    UndefinedVariable(String),
+    UndefinedVariable(VariableName),
     /// 未定義の関数を呼び出し
-    UndefinedFunction(String),
+    UndefinedFunction(FunctionName),
     /// 型の不一致 (context は "in let", "return type" など文脈を示す)
     TypeMismatch {
         context: &'static str,
@@ -29,13 +30,13 @@ pub enum AnalyzeErrorKind {
     BinaryOpTypeMismatch { lhs: Type, rhs: Type },
     /// ユーザー定義関数の引数の数が合わない
     ArgumentCountMismatch {
-        function: String,
+        function: FunctionName,
         expected: usize,
         found: usize,
     },
     /// ユーザー定義関数の引数の型が合わない
     ArgumentTypeMismatch {
-        function: String,
+        function: FunctionName,
         expected: Type,
         found: Type,
     },
@@ -82,33 +83,42 @@ pub enum AnalyzeErrorKind {
     /// match アームが空
     MatchNoArms,
     /// 未定義の enum
-    UndefinedEnum(String),
+    UndefinedEnum(TypeName),
     /// 未定義の enum variant
-    UndefinedEnumVariant { enum_name: String, variant: String },
+    UndefinedEnumVariant {
+        enum_name: TypeName,
+        variant: VariantName,
+    },
     /// match の enum 網羅性不足
     NonExhaustiveMatch {
-        enum_name: String,
-        missing: Vec<String>,
+        enum_name: TypeName,
+        missing: Vec<VariantName>,
     },
     /// 不明な型名
-    UnknownType(String),
+    UnknownType(TypeName),
     /// random_enum の引数が enum 名でない
-    RandomEnumArgNotEnum(String),
+    RandomEnumArgNotEnum(VariableName),
     /// 未定義の struct
-    UndefinedStruct(String),
+    UndefinedStruct(TypeName),
     /// 未定義のフィールド
-    UndefinedField { struct_name: String, field: String },
+    UndefinedField {
+        struct_name: TypeName,
+        field: FieldName,
+    },
     /// struct リテラルで必須フィールドが不足
     MissingFields {
-        struct_name: String,
-        missing: Vec<String>,
+        struct_name: TypeName,
+        missing: Vec<FieldName>,
     },
     /// struct リテラルでフィールドが重複
-    DuplicateField { struct_name: String, field: String },
+    DuplicateField {
+        struct_name: TypeName,
+        field: FieldName,
+    },
     /// フィールドアクセスの対象が struct でない
     FieldAccessOnNonStruct(Type),
     /// イミュータブル変数への代入
-    ImmutableAssignment(String),
+    ImmutableAssignment(VariableName),
 }
 
 /// 意味解析エラー
@@ -217,7 +227,11 @@ impl std::fmt::Display for AnalyzeError {
             AnalyzeErrorKind::NonExhaustiveMatch { enum_name, missing } => write!(
                 f,
                 "non-exhaustive match on '{enum_name}': missing {}",
-                missing.join(", ")
+                missing
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             AnalyzeErrorKind::UnknownType(name) => write!(f, "unknown type: '{name}'"),
             AnalyzeErrorKind::RandomEnumArgNotEnum(name) => {
@@ -235,7 +249,11 @@ impl std::fmt::Display for AnalyzeError {
             } => write!(
                 f,
                 "missing fields in struct '{struct_name}': {}",
-                missing.join(", ")
+                missing
+                    .iter()
+                    .map(|f| f.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             AnalyzeErrorKind::DuplicateField { struct_name, field } => {
                 write!(f, "duplicate field '{field}' in struct '{struct_name}'")
@@ -260,17 +278,17 @@ struct FnSig {
 /// 意味解析器
 pub struct Analyzer {
     /// グローバル変数の型
-    globals: HashMap<String, Type>,
+    globals: HashMap<VariableName, Type>,
     /// ミュータブルなグローバル変数の名前
-    mutable_globals: HashSet<String>,
+    mutable_globals: HashSet<VariableName>,
     /// ユーザー定義関数のシグネチャ
-    functions: HashMap<String, FnSig>,
+    functions: HashMap<FunctionName, FnSig>,
     /// ユーザー定義 enum (名前 → variant リスト)
-    enums: HashMap<String, Vec<String>>,
+    enums: HashMap<TypeName, Vec<VariantName>>,
     /// ユーザー定義 struct (名前 → フィールド定義リスト)
-    structs: HashMap<String, Vec<StructField>>,
+    structs: HashMap<TypeName, Vec<StructField>>,
     /// ローカルスコープスタック
-    locals: Vec<HashMap<String, Type>>,
+    locals: Vec<HashMap<VariableName, Type>>,
     /// 現在の関数の戻り値型
     current_return_type: Option<Type>,
     /// loop のネスト深さ
@@ -452,7 +470,7 @@ impl Analyzer {
         }
     }
 
-    fn insert_local(&mut self, name: String, ty: Type) {
+    fn insert_local(&mut self, name: VariableName, ty: Type) {
         if let Some(scope) = self.locals.last_mut() {
             scope.insert(name, ty);
         }
@@ -487,7 +505,7 @@ impl Analyzer {
             ExprKind::IntLiteral(_) => Some(Type::U8),
             ExprKind::BoolLiteral(_) => Some(Type::Bool),
             ExprKind::Ident(name) => {
-                if let Some(ty) = self.lookup_var(name) {
+                if let Some(ty) = self.lookup_var(name.as_str()) {
                     Some(ty)
                 } else {
                     self.errors.push(AnalyzeError {
@@ -575,8 +593,8 @@ impl Analyzer {
                         return None;
                     }
                     if let ExprKind::Ident(name) = &args[0].kind {
-                        if self.enums.contains_key(name) {
-                            return Some(Type::UserType(name.clone()));
+                        if self.enums.contains_key(name.as_str()) {
+                            return Some(Type::UserType(TypeName::new(name.as_str())));
                         } else {
                             self.errors.push(AnalyzeError {
                                 kind: AnalyzeErrorKind::RandomEnumArgNotEnum(name.clone()),
@@ -586,9 +604,9 @@ impl Analyzer {
                         }
                     } else {
                         self.errors.push(AnalyzeError {
-                            kind: AnalyzeErrorKind::RandomEnumArgNotEnum(
-                                "<non-identifier>".to_string(),
-                            ),
+                            kind: AnalyzeErrorKind::RandomEnumArgNotEnum(VariableName::new(
+                                "<non-identifier>",
+                            )),
                             span: expr.span,
                         });
                         return None;
@@ -764,7 +782,7 @@ impl Analyzer {
                 if let Some(Type::UserType(ref enum_name)) = scr_ty
                     && let Some(all_variants) = self.enums.get(enum_name).cloned()
                 {
-                    let covered: Vec<String> = arms
+                    let covered: Vec<VariantName> = arms
                         .iter()
                         .filter_map(|arm| {
                             if let ExprKind::EnumVariant { variant, .. } = &arm.pattern.kind {
@@ -774,7 +792,7 @@ impl Analyzer {
                             }
                         })
                         .collect();
-                    let missing: Vec<String> = all_variants
+                    let missing: Vec<VariantName> = all_variants
                         .into_iter()
                         .filter(|v| !covered.contains(v))
                         .collect();
@@ -860,7 +878,7 @@ impl Analyzer {
                     }
                     // base なしの場合、全フィールドが指定されているかチェック
                     if base.is_none() {
-                        let missing: Vec<String> = struct_fields
+                        let missing: Vec<FieldName> = struct_fields
                             .iter()
                             .filter(|f| !seen.contains(&f.name))
                             .map(|f| f.name.clone())
@@ -998,12 +1016,12 @@ impl Analyzer {
                 self.insert_local(name.clone(), ty.clone());
             }
             StmtKind::Assign { name, value } => {
-                let var_ty = self.lookup_var(name);
+                let var_ty = self.lookup_var(name.as_str());
                 let val_ty = self.type_check_expr(value);
                 // グローバル変数への代入は mutable でなければエラー
-                let is_global = self.globals.contains_key(name)
-                    && !self.locals.iter().any(|s| s.contains_key(name));
-                if is_global && !self.mutable_globals.contains(name) {
+                let is_global = self.globals.contains_key(name.as_str())
+                    && !self.locals.iter().any(|s| s.contains_key(name.as_str()));
+                if is_global && !self.mutable_globals.contains(name.as_str()) {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::ImmutableAssignment(name.clone()),
                         span: stmt.span,
@@ -1035,7 +1053,7 @@ impl Analyzer {
                 index,
                 value,
             } => {
-                let arr_ty = self.lookup_var(array);
+                let arr_ty = self.lookup_var(array.as_str());
                 // 配列型チェック
                 if let Some(ref ty) = arr_ty {
                     if !matches!(ty, Type::Array { .. }) {
@@ -1062,9 +1080,9 @@ impl Analyzer {
                 // 値の型チェック
                 self.type_check_expr(value);
                 // mutable チェック
-                let is_global = self.globals.contains_key(array)
-                    && !self.locals.iter().any(|s| s.contains_key(array));
-                if is_global && !self.mutable_globals.contains(array) {
+                let is_global = self.globals.contains_key(array.as_str())
+                    && !self.locals.iter().any(|s| s.contains_key(array.as_str()));
+                if is_global && !self.mutable_globals.contains(array.as_str()) {
                     self.errors.push(AnalyzeError {
                         kind: AnalyzeErrorKind::ImmutableAssignment(array.clone()),
                         span: stmt.span,
