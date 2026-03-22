@@ -1,5 +1,6 @@
 use chip8_lang::analyzer::{AnalyzeError, AnalyzeErrorKind, Analyzer};
 use chip8_lang::lexer::Lexer;
+use chip8_lang::names::{FieldName, TypeName, VariableName, VariantName};
 use chip8_lang::parser::Parser;
 use chip8_lang::parser::ast::{BuiltinFunction, Type};
 
@@ -405,8 +406,8 @@ fn test_enum_undefined_variant() {
             Dir::Left
          }",
         AnalyzeErrorKind::UndefinedEnumVariant {
-            enum_name: "Dir".to_string(),
-            variant: "Left".to_string(),
+            enum_name: TypeName::from("Dir"),
+            variant: VariantName::from("Left"),
         },
     );
 }
@@ -418,7 +419,7 @@ fn test_enum_undefined_enum() {
             let x: u8 = 0;
             Foo::Bar;
          }",
-        AnalyzeErrorKind::UndefinedEnum("Foo".to_string()),
+        AnalyzeErrorKind::UndefinedEnum(TypeName::from("Foo")),
     );
 }
 
@@ -448,8 +449,8 @@ fn test_match_enum_non_exhaustive() {
             }
          }",
         AnalyzeErrorKind::NonExhaustiveMatch {
-            enum_name: "Dir".to_string(),
-            missing: vec!["Left".to_string()],
+            enum_name: TypeName::from("Dir"),
+            missing: vec![VariantName::from("Left")],
         },
     );
 }
@@ -460,7 +461,7 @@ fn test_unknown_type() {
         "fn main() -> () {
             let x: Foo = 0;
          }",
-        AnalyzeErrorKind::UnknownType("Foo".to_string()),
+        AnalyzeErrorKind::UnknownType(TypeName::from("Foo")),
     );
 }
 
@@ -488,7 +489,7 @@ fn test_random_enum_returns_enum_type() {
 fn test_random_enum_not_enum_name() {
     analyze_err_kind(
         "fn main() -> u8 { random_enum(Foo) }",
-        AnalyzeErrorKind::RandomEnumArgNotEnum("Foo".to_string()),
+        AnalyzeErrorKind::RandomEnumArgNotEnum(VariableName::from("Foo")),
     );
 }
 
@@ -530,8 +531,8 @@ fn test_struct_undefined_field() {
         "struct Pos { x: u8, y: u8 }
          fn main() -> Pos { Pos { x: 1, z: 2 } }",
         AnalyzeErrorKind::UndefinedField {
-            struct_name: "Pos".to_string(),
-            field: "z".to_string(),
+            struct_name: TypeName::from("Pos"),
+            field: FieldName::from("z"),
         },
     );
 }

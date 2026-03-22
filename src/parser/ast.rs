@@ -1,4 +1,5 @@
 use crate::lexer::token::Span;
+use crate::names::{FieldName, FunctionName, TypeName, VariableName, VariantName};
 
 /// 型
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8,7 +9,7 @@ pub enum Type {
     Unit,
     Array(Box<Type>, usize),
     Sprite(usize),
-    UserType(String),
+    UserType(TypeName),
 }
 
 /// 二項演算子
@@ -47,7 +48,7 @@ pub struct Expr {
 pub enum ExprKind {
     IntLiteral(u64),
     BoolLiteral(bool),
-    Ident(String),
+    Ident(VariableName),
     BinaryOp {
         op: BinOp,
         lhs: Box<Expr>,
@@ -58,7 +59,7 @@ pub enum ExprKind {
         expr: Box<Expr>,
     },
     Call {
-        name: String,
+        name: FunctionName,
         args: Vec<Expr>,
     },
     BuiltinCall {
@@ -88,17 +89,17 @@ pub enum ExprKind {
         arms: Vec<MatchArm>,
     },
     EnumVariant {
-        enum_name: String,
-        variant: String,
+        enum_name: TypeName,
+        variant: VariantName,
     },
     StructLiteral {
-        name: String,
-        fields: Vec<(String, Expr)>,
+        name: TypeName,
+        fields: Vec<(FieldName, Expr)>,
         base: Option<Box<Expr>>,
     },
     FieldAccess {
         expr: Box<Expr>,
-        field: String,
+        field: FieldName,
     },
 }
 
@@ -119,16 +120,16 @@ pub struct Stmt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StmtKind {
     Let {
-        name: String,
+        name: VariableName,
         ty: Type,
         value: Expr,
     },
     Assign {
-        name: String,
+        name: VariableName,
         value: Expr,
     },
     IndexAssign {
-        array: String,
+        array: VariableName,
         index: Expr,
         value: Expr,
     },
@@ -140,14 +141,14 @@ pub enum StmtKind {
 /// struct のフィールド定義
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructField {
-    pub name: String,
+    pub name: FieldName,
     pub ty: Type,
 }
 
 /// 関数の引数
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Param {
-    pub name: String,
+    pub name: VariableName,
     pub ty: Type,
 }
 
@@ -155,26 +156,26 @@ pub struct Param {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopLevel {
     FnDef {
-        name: String,
+        name: FunctionName,
         params: Vec<Param>,
         return_type: Type,
         body: Expr,
         span: Span,
     },
     LetDef {
-        name: String,
+        name: VariableName,
         ty: Type,
         value: Expr,
         mutable: bool,
         span: Span,
     },
     EnumDef {
-        name: String,
-        variants: Vec<String>,
+        name: TypeName,
+        variants: Vec<VariantName>,
         span: Span,
     },
     StructDef {
-        name: String,
+        name: TypeName,
         fields: Vec<StructField>,
         span: Span,
     },

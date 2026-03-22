@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::chip8::{Addr, ByteOffset, Opcode, Register, SpriteHeight, UserRegister};
+use crate::names::{FieldName, FunctionName, TypeName, VariableName, VariantName};
 use crate::parser::ast::*;
 
 /// CHIP-8 命令のバイト数
@@ -12,10 +13,10 @@ enum ValueLocation {
     /// 値はレジスタに格納されている
     InRegister(Register),
     /// struct の値: メモリに格納 (アドレスと struct 名)
-    InMemory { addr: u16, struct_name: String },
+    InMemory { addr: u16, struct_name: TypeName },
     /// struct の値: 連続レジスタに保持
     InRegisters {
-        struct_name: String,
+        struct_name: TypeName,
         base_reg: UserRegister,
         field_count: u8,
     },
@@ -46,9 +47,9 @@ struct ForwardRef {
 #[derive(Debug)]
 enum ForwardRefKind {
     /// 関数呼び出し (CALL addr)
-    Call(String),
+    Call(FunctionName),
     /// グローバル変数のアドレス (LD I, addr)
-    GlobalAddr(String),
+    GlobalAddr(VariableName),
 }
 
 /// ローカル変数のバインディング情報
@@ -57,10 +58,10 @@ enum LocalBinding {
     /// スカラー値 (u8, bool, enum)
     Single(UserRegister),
     /// struct 値: メモリに格納 (アドレスと struct 名)
-    StructInMemory { addr: u16, struct_name: String },
+    StructInMemory { addr: u16, struct_name: TypeName },
     /// struct 値: 連続レジスタに保持 (base_reg から field_count 個)
     StructInRegisters {
-        struct_name: String,
+        struct_name: TypeName,
         base_reg: UserRegister,
         field_count: u8,
     },
@@ -70,7 +71,7 @@ enum LocalBinding {
 #[derive(Debug, Clone)]
 struct FunctionMeta {
     /// 呼び出すユーザー定義関数のリスト
-    callees: HashSet<String>,
+    callees: HashSet<FunctionName>,
     /// 他のユーザー定義関数を呼ばない (callees が空)
     is_leaf: bool,
     /// パラメータのフラット化レジスタ数 (struct レジスタ保持最適化で使用予定)
@@ -92,29 +93,29 @@ pub struct CodeGen {
     /// データセクション (スプライトなど)
     data: Vec<u8>,
     /// 関数名 → 確定アドレス
-    fn_addrs: HashMap<String, Addr>,
+    fn_addrs: HashMap<FunctionName, Addr>,
     /// グローバル変数名 → データセクション内のバイトオフセット (Pass 1 で記録)
-    data_offsets: HashMap<String, u16>,
+    data_offsets: HashMap<VariableName, u16>,
     /// グローバル変数名 → 最終解決済みアドレス (generate() 末尾で確定)
-    resolved_addrs: HashMap<String, Addr>,
+    resolved_addrs: HashMap<VariableName, Addr>,
     /// グローバル変数のスプライトサイズ (バイト数)
-    sprite_sizes: HashMap<String, usize>,
+    sprite_sizes: HashMap<VariableName, usize>,
     /// enum variant → u8 値
-    enum_variant_values: HashMap<(String, String), u8>,
+    enum_variant_values: HashMap<(TypeName, VariantName), u8>,
     /// ミュータブルグローバル変数
-    mutable_globals: HashSet<String>,
+    mutable_globals: HashSet<VariableName>,
     /// struct 定義 (名前 → フィールド定義リスト)
-    struct_defs: HashMap<String, Vec<StructField>>,
+    struct_defs: HashMap<TypeName, Vec<StructField>>,
     /// 関数の戻り値型 (struct 戻り値のメモリ化に使用)
-    fn_return_types: HashMap<String, Type>,
+    fn_return_types: HashMap<FunctionName, Type>,
     /// 関数ごとの最適化メタデータ (コールグラフ解析結果)
-    fn_meta: HashMap<String, FunctionMeta>,
+    fn_meta: HashMap<FunctionName, FunctionMeta>,
     /// 関数の AST 本体 (インライン展開用)
-    fn_bodies: HashMap<String, (Vec<Param>, Expr)>,
+    fn_bodies: HashMap<FunctionName, (Vec<Param>, Expr)>,
     /// メモリスロット割り当て用の次のアドレス (struct データ + caller-save 共用)
     next_save_slot: u16,
     /// ローカル変数名 → 割り当て済みバインディング
-    local_bindings: HashMap<String, LocalBinding>,
+    local_bindings: HashMap<VariableName, LocalBinding>,
     /// 次に割り当て可能なレジスタ番号
     next_free_reg: u8,
     /// ローカル変数にバインド済みのレジスタ数 (一時レジスタのリセット基準)
@@ -124,7 +125,7 @@ pub struct CodeGen {
     /// ループごとの break 先パッチオフセットのスタック
     loop_break_offsets: Vec<Vec<ByteOffset>>,
     /// 現在コード生成中の関数名 (TCO 検出用)
-    current_fn_name: Option<String>,
+    current_fn_name: Option<FunctionName>,
     /// 現在の関数の先頭アドレス (TCO ジャンプ先)
     current_fn_start_addr: Option<Addr>,
     /// 現在の関数のパラメータ数 (TCO 引数コピー用)
@@ -371,7 +372,7 @@ impl CodeGen {
                         }
                     }
                 }
-                if self.current_fn_name.as_deref() == Some("main") {
+                if self.current_fn_name.as_ref().map(|n| n.as_str()) == Some("main") {
                     // main は JP で呼ばれるため RET ではなくセルフループで停止
                     let halt_addr = self.current_addr();
                     self.emit_op(Opcode::Jp(halt_addr));
@@ -499,7 +500,10 @@ impl CodeGen {
                 flat_args[j] == target && flat_args[j] != target_j
             });
             if will_be_read_later {
-                assert!(next_tmp <= 14, "not enough temp registers for parallel move");
+                assert!(
+                    next_tmp <= 14,
+                    "not enough temp registers for parallel move"
+                );
                 let tmp: Register = UserRegister::new(next_tmp).into();
                 next_tmp += 1;
                 self.emit_op(Opcode::LdReg(tmp, target));
@@ -537,7 +541,7 @@ impl CodeGen {
     }
 
     /// 式中で参照されている変数名を収集する。
-    fn collect_referenced_vars(expr: &Expr, out: &mut HashSet<String>) {
+    fn collect_referenced_vars(expr: &Expr, out: &mut HashSet<VariableName>) {
         match &expr.kind {
             ExprKind::Ident(name) => {
                 out.insert(name.clone());
@@ -561,7 +565,7 @@ impl CodeGen {
         }
     }
 
-    fn lookup_binding(&self, name: &str) -> Option<&LocalBinding> {
+    fn lookup_binding(&self, name: &VariableName) -> Option<&LocalBinding> {
         self.local_bindings.get(name)
     }
 
@@ -570,7 +574,7 @@ impl CodeGen {
     }
 
     /// struct のフラット化フィールド数を計算
-    fn struct_field_count(&self, struct_name: &str) -> usize {
+    fn struct_field_count(&self, struct_name: &TypeName) -> usize {
         if let Some(fields) = self.struct_defs.get(struct_name) {
             fields
                 .iter()
@@ -589,11 +593,11 @@ impl CodeGen {
     }
 
     /// struct 内のフィールドのレジスタオフセットを計算
-    fn struct_field_offset(&self, struct_name: &str, field_name: &str) -> Option<usize> {
+    fn struct_field_offset(&self, struct_name: &TypeName, field_name: &FieldName) -> Option<usize> {
         let fields = self.struct_defs.get(struct_name)?;
         let mut offset = 0;
         for f in fields {
-            if f.name == field_name {
+            if f.name == *field_name {
                 return Some(offset);
             }
             if let Type::UserType(ref name) = f.ty
@@ -608,23 +612,23 @@ impl CodeGen {
     }
 
     /// struct のフィールドの型を取得
-    fn struct_field_type(&self, struct_name: &str, field_name: &str) -> Option<Type> {
+    fn struct_field_type(&self, struct_name: &TypeName, field_name: &FieldName) -> Option<Type> {
         let fields = self.struct_defs.get(struct_name)?;
         fields
             .iter()
-            .find(|f| f.name == field_name)
+            .find(|f| f.name == *field_name)
             .map(|f| f.ty.clone())
     }
 
-    fn emit_ld_i_global(&mut self, name: &str) {
+    fn emit_ld_i_global(&mut self, name: &VariableName) {
         let offset = self.emit_placeholder();
         self.forward_refs.push(ForwardRef {
             offset,
-            kind: ForwardRefKind::GlobalAddr(name.to_string()),
+            kind: ForwardRefKind::GlobalAddr(name.clone()),
         });
     }
 
-    fn emit_global_read(&mut self, target_reg: Register, name: &str) {
+    fn emit_global_read(&mut self, target_reg: Register, name: &VariableName) {
         if target_reg == Register::V0 {
             self.emit_ld_i_global(name);
             self.emit_op(Opcode::LdVxI(Register::V0));
@@ -642,7 +646,7 @@ impl CodeGen {
         }
     }
 
-    fn emit_global_write(&mut self, name: &str, src_reg: Register) {
+    fn emit_global_write(&mut self, name: &VariableName, src_reg: Register) {
         if src_reg == Register::V0 {
             self.emit_ld_i_global(name);
             self.emit_op(Opcode::LdIVx(Register::V0));
@@ -807,7 +811,7 @@ impl CodeGen {
     /// AST を走査して関数ごとのメタデータを構築する
     fn analyze_call_graph(&mut self, program: &Program) {
         // 全関数名を収集 (ユーザー定義関数の判定用)
-        let fn_names: HashSet<String> = program
+        let fn_names: HashSet<FunctionName> = program
             .top_levels
             .iter()
             .filter_map(|top| {
@@ -864,8 +868,8 @@ impl CodeGen {
     }
 
     /// インライン展開すべきかどうかを判定
-    fn should_inline(&self, name: &str) -> bool {
-        if name == "main" {
+    fn should_inline(&self, name: &FunctionName) -> bool {
+        if name.as_str() == "main" {
             return false;
         }
         let Some(meta) = self.fn_meta.get(name) else {
@@ -879,7 +883,7 @@ impl CodeGen {
     }
 
     /// 現在のレジスタ使用状況でインライン展開が安全かを判定
-    fn can_inline_here(&self, name: &str) -> bool {
+    fn can_inline_here(&self, name: &FunctionName) -> bool {
         if !self.should_inline(name) {
             return false;
         }
@@ -891,7 +895,11 @@ impl CodeGen {
     }
 
     /// 式中のユーザー定義関数呼び出しを再帰的に収集
-    fn collect_callees(expr: &Expr, fn_names: &HashSet<String>, out: &mut HashSet<String>) {
+    fn collect_callees(
+        expr: &Expr,
+        fn_names: &HashSet<FunctionName>,
+        out: &mut HashSet<FunctionName>,
+    ) {
         match &expr.kind {
             ExprKind::Call { name, args } => {
                 if fn_names.contains(name) {
@@ -969,7 +977,11 @@ impl CodeGen {
     }
 
     /// 文中のユーザー定義関数呼び出しを再帰的に収集
-    fn collect_callees_stmt(stmt: &Stmt, fn_names: &HashSet<String>, out: &mut HashSet<String>) {
+    fn collect_callees_stmt(
+        stmt: &Stmt,
+        fn_names: &HashSet<FunctionName>,
+        out: &mut HashSet<FunctionName>,
+    ) {
         match &stmt.kind {
             StmtKind::Let { value, .. } => Self::collect_callees(value, fn_names, out),
             StmtKind::Assign { value, .. } => Self::collect_callees(value, fn_names, out),
@@ -1192,7 +1204,7 @@ impl CodeGen {
     ///
     /// CALL/RET + caller-save/restore を完全に省略し、
     /// callee の本体を caller のコンテキストに直接埋め込む。
-    fn codegen_inline_call(&mut self, name: &str, args: &[Expr]) -> ValueLocation {
+    fn codegen_inline_call(&mut self, name: &FunctionName, args: &[Expr]) -> ValueLocation {
         let (params, body) = self.fn_bodies.get(name).unwrap().clone();
 
         // 1. 引数を評価 (caller のコンテキストで)
@@ -1200,7 +1212,7 @@ impl CodeGen {
         // 保護する。式引数の評価が元の変数レジスタを破壊しても、先に評価済みの
         // 引数値が影響を受けないようにする。(issue #64)
         let has_expr_args = args.iter().any(|a| !Self::is_safe_arg(a));
-        let mut arg_locs: Vec<(String, Type, ValueLocation)> = Vec::new();
+        let mut arg_locs: Vec<(VariableName, Type, ValueLocation)> = Vec::new();
         for (i, (param, arg)) in params.iter().zip(args.iter()).enumerate() {
             let loc = self.codegen_expr(arg);
             let needs_protect = if has_expr_args {
@@ -1341,7 +1353,7 @@ impl CodeGen {
     fn codegen_expr_tail(&mut self, expr: &Expr) -> ValueLocation {
         match &expr.kind {
             // 末尾位置での自己再帰呼び出し → TCO
-            ExprKind::Call { name, args } if self.current_fn_name.as_deref() == Some(name) => {
+            ExprKind::Call { name, args } if self.current_fn_name.as_ref() == Some(name) => {
                 let fn_start = self.current_fn_start_addr.unwrap();
                 let param_count = self.current_fn_param_count;
 
@@ -2323,9 +2335,9 @@ impl CodeGen {
     fn codegen_struct_equality_memory(
         &mut self,
         l_addr: u16,
-        l_name: &str,
+        l_name: &TypeName,
         r_addr: u16,
-        _r_name: &str,
+        _r_name: &TypeName,
         is_eq: bool,
     ) -> ValueLocation {
         let count = self.struct_field_count(l_name);
@@ -2483,7 +2495,7 @@ impl CodeGen {
             BuiltinFunction::RandomEnum => {
                 // args[0] は Ident(enum_name)
                 let enum_name = if let ExprKind::Ident(name) = &args[0].kind {
-                    name.clone()
+                    TypeName::new(name.as_str())
                 } else {
                     return ValueLocation::Void;
                 };
